@@ -1,12 +1,13 @@
-"""Global scene registry for NullSplats cache directories."""
+"""Application state container for NullSplats."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Set
+from typing import List, Optional, Set
 
 from nullsplats.backend.io_cache import ScenePaths
+from nullsplats.util.config import AppConfig
 from nullsplats.util.scene_id import SceneId
 
 
@@ -69,4 +70,25 @@ class SceneRegistry:
         return path.exists() and any(path.iterdir())
 
 
-__all__ = ["SceneRegistry", "SceneStatus"]
+class AppState:
+    """Global state shared across the UI."""
+
+    def __init__(self, config: Optional[AppConfig] = None) -> None:
+        self.config = config or AppConfig()
+        self.scene_registry = SceneRegistry(cache_root=self.config.cache_root)
+        self.current_scene_id: Optional[SceneId] = None
+
+    def refresh_scene_status(self) -> List[SceneStatus]:
+        """Re-scan the cache and return all scene statuses."""
+        return self.scene_registry.list_scenes()
+
+    def set_current_scene(self, scene_id: Optional[str | SceneId]) -> Optional[SceneId]:
+        """Update the active scene, returning the normalized SceneId or None."""
+        if scene_id is None:
+            self.current_scene_id = None
+            return None
+        self.current_scene_id = SceneId(str(scene_id))
+        return self.current_scene_id
+
+
+__all__ = ["AppState", "SceneRegistry", "SceneStatus"]

@@ -37,39 +37,43 @@ Repository layout for NullSplats:
 .
 +- main.py                 Entry point for the Tkinter application.
 +- nullsplats/             Python package.
-¦  +- __init__.py
-¦  +- app_state.py         Global application state and scene registry.
-¦  +- ui/
-¦  ¦  +- root.py           Tk root creation, menubar, notebook tabs.
-¦  ¦  +- tab_inputs.py     Inputs tab widgets plus callbacks.
-¦  ¦  +- tab_training.py   Training tab widgets plus callbacks.
-¦  ¦  +- tab_exports.py    Exports tab widgets plus callbacks.
-¦  ¦  +- gl_canvas.py      OpenGL-backed canvas embedded in Tk.
-¦  +- backend/
-¦  ¦  +- io_cache.py       Cache abstraction for inputs and outputs.
-¦  ¦  +- video_frames.py   Video frame extraction and scoring.
-¦  ¦  +- sfm_pipeline.py   COLMAP and GLOMAP command-line integration.
-¦  ¦  +- splat_train.py    gsplat-based training loop and checkpointing.
-¦  ¦  +- splat_export.py   Export helpers and render routines.
-¦  +- util/
-¦     +- config.py         Paths, tunables, and defaults.
-¦     +- threading.py      Helper for background tasks and progress.
+   +- __init__.py
+   +- app_state.py         Global application state and scene registry.
+   +- ui/
+      +- __init__.py
+      +- root.py           Tk root creation, menubar, notebook tabs.
+      +- tab_inputs.py     Inputs tab widgets plus callbacks.
+      +- tab_training.py   Training tab widgets plus callbacks.
+      +- tab_exports.py    Exports tab widgets plus callbacks.
+      +- gl_canvas.py      OpenGL-backed canvas embedded in Tk.
+   +- backend/
+      +- io_cache.py       Cache abstraction for inputs and outputs.
+      +- video_frames.py   Video frame extraction and scoring.
+      +- sfm_pipeline.py   COLMAP and GLOMAP command-line integration.
+      +- splat_train.py    gsplat-based training loop and checkpointing.
+      +- splat_export.py   Export helpers and render routines.
+   +- util/
+      +- config.py         Paths, tunables, and defaults.
+      +- threading.py      Helper for background tasks and progress.
+      +- logging.py        Console and file logging setup.
 +- tools/
-¦  +- setup_cuda_venv.bat  PyTorch plus gsplat environment bootstrapper.
-¦  +- build.bat            Nuitka onefile build script for Windows.
+   +- setup_cuda_venv.bat  PyTorch plus gsplat environment bootstrapper.
+   +- build.bat            Nuitka onefile build script for Windows.
++- tests/
+   +- run_checks.bat       One-shot script to run py_compile, imports, UI, and tests.
 +- cache/
-¦  +- inputs/
-¦  ¦  +- <scene_id>/
-¦  ¦     +- source/
-¦  ¦     ¦  +- video.mp4          Original video or equivalent.
-¦  ¦     +- frames_all/           Full set of extracted frames.
-¦  ¦     +- frames_selected/      Subset selected for training.
-¦  ¦     +- metadata.json         Scene and selection metadata.
-¦  +- outputs/
-¦     +- <scene_id>/
-¦        +- sfm/                  COLMAP and GLOMAP outputs.
-¦        +- splats/               Splat snapshots and training logs.
-¦        +- renders/              Optional rendered flythroughs.
+   +- inputs/
+      +- <scene_id>/
+         +- source/
+            +- video.mp4          Original video or equivalent.
+         +- frames_all/           Full set of extracted frames.
+         +- frames_selected/      Subset selected for training.
+         +- metadata.json         Scene and selection metadata.
+   +- outputs/
+      +- <scene_id>/
+         +- sfm/                  COLMAP and GLOMAP outputs.
+         +- splats/               Splat snapshots and training logs.
+         +- renders/              Optional rendered flythroughs.
 +- .github/
    +- workflows/
       +- build-windows.yml        Tag-triggered Nuitka build workflow.
@@ -360,8 +364,7 @@ ACTIVE WORK SECTION
 This section describes the expected general workflow for a robot working inside the repository.
 
 Active Work (single entry for robots):
-
-- None; TODO-0 completed. Select the next TODO before further changes.
+- None; select the next TODO before further changes.
 
 Workflow for robot operations:
 
@@ -424,7 +427,7 @@ TODO-0 (completed): Global concepts and conventions
   - Runnable step:
     - python -m unittest discover -s tests
 
-TODO-1: App skeleton and threading model
+TODO-1 (completed): App skeleton and threading model
 
 - Root UI creation:
   - Implement nullsplats/ui/root.py with:
@@ -520,7 +523,7 @@ TODO-5: Configuration, settings, and logging
     - python main.py
     - Human opens Settings and adjusts values.
 - Logging:
-  - Implement a logging helper that writes to logs/app.log.
+  - Logging helper exists (util.logging.setup_logging writes to logs/app.log and console).
   - Ensure background loops use this helper.
   - Runnable step:
     - python main.py
