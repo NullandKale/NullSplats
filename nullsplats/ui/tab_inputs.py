@@ -8,7 +8,7 @@ from tkinter import filedialog, ttk
 from typing import Callable, Dict, List, Optional
 
 from nullsplats.app_state import AppState, SceneStatus
-from nullsplats.backend.io_cache import ensure_scene_dirs, delete_scene
+from nullsplats.backend.io_cache import ScenePaths, ensure_scene_dirs, delete_scene
 from nullsplats.backend.video_frames import (
     ExtractionResult,
     FrameScore,
@@ -198,6 +198,7 @@ class InputsTab:
             self.scene_entry.delete(0, tk.END)
             self.scene_entry.insert(0, str(normalized))
         self._sync_status()
+        self._auto_load_cached_for_scene(str(normalized))
 
     def _create_scene(self) -> None:
         source_path = self._current_source_path()
@@ -479,6 +480,13 @@ class InputsTab:
             # ensure UI state is synced before saving
             self.frame_vars[filename].get()
         self._persist_selection()
+
+    def _auto_load_cached_for_scene(self, scene_id: str) -> None:
+        if self._extracting:
+            return
+        paths = ScenePaths(scene_id, cache_root=self.app_state.config.cache_root)
+        if paths.metadata_path.exists():
+            self._load_cached()
 
     def _persist_selection(self) -> None:
         scene_id = self._require_scene()

@@ -17,6 +17,8 @@ from nullsplats.backend.video_frames import (
     load_cached_frames,
     persist_selection,
 )
+from nullsplats.backend.sfm_pipeline import SfmConfig, SfmResult, run_sfm
+from nullsplats.backend.splat_train import SplatTrainingConfig, TrainingResult, train_scene
 
 __all__ = [
     "SceneId",
@@ -32,4 +34,10 @@ __all__ = [
     "extract_frames",
     "load_cached_frames",
     "persist_selection",
+    "SfmConfig",
+    "SfmResult",
+    "run_sfm",
+    "SplatTrainingConfig",
+    "TrainingResult",
+    "train_scene",
 ]

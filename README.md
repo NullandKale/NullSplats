@@ -133,12 +133,19 @@ Expected environment for running NullSplats:
   - Windows compatible with CUDA and the used dependencies.
 - GPU:
   - NVIDIA GPU with a CUDA driver compatible with CUDA 12.x.
+- PyTorch with CUDA:
+  - Training is GPU-only; install a CUDA build of PyTorch and ensure `torch.cuda.is_available()` returns True.
 - Python:
   - Version 3.10 or higher, installed and on PATH.
 - CUDA toolkit:
   - Installed and accessible to PyTorch and gsplat.
+  - gsplat JIT-compiles its CUDA extension at runtime using the system toolkit (currently targeting CUDA 12.8). When producing a shippable exe we must plan how to supply a matching toolkit or prebuilt extension; this is not bundled yet.
 - COLMAP and GLOMAP:
   - Installed as separate tools and available to the application via configured paths.
+  - Repo-local defaults: `tools\COLMAP-3.7-windows-cuda\bin\colmap.exe` is preferred so PATH changes are unnecessary; enter this full path in the Training tab if not already prefilled. GLOMAP is staged for TODO-7; keep a real binary under `tools\glomap\bin` for future integration even though the current UI only drives COLMAP.
+  - COLMAP: CUDA build such as `C:\Repos\COLMAP-3.7-windows-cuda\bin` also works if you point the Training tab to the binary.
+  - GLOMAP: download the release from https://github.com/MariusKM/Colmap_CeresS_withCuDSS/releases/tag/v.1.0 and place `glomap.exe` under a stable folder (for example, `tools\glomap\bin`) for the upcoming TODO-7 integration.
+  - COLMAP bundle adjustment speed tips: see https://github.com/colmap/colmap/blob/main/doc/faq.rst#speedup-bundle-adjustemnt when tuning SfM performance.
 
 Virtual environment setup with the supplied helper script:
 
@@ -230,39 +237,27 @@ Training tab:
   - Scene dropdown linked to the global Scene Registry.
   - Status indicator for inputs (e.g., `Frames selected: 40`).
 - Section for camera poses (SfM):
-  - Text entries and browse buttons for COLMAP and GLOMAP binary paths.
+  - Text entry and browse button for the COLMAP binary path (GLOMAP integration is deferred to TODO-7).
   - Buttons:
-    - Run COLMAP + GLOMAP:
+    - Run COLMAP + Train:
       - Validates that frames_selected exists and contains images.
-      - Invokes COLMAP feature extraction and matching.
-      - Invokes GLOMAP on the COLMAP database.
-      - Writes outputs and logs under cache/outputs/<scene_id>/sfm.
-    - View SfM Log:
-      - Opens or displays the SfM log for inspection.
+      - Invokes COLMAP feature extraction, matching, mapper, and model conversion to PLY.
+      - Exports a text model (cameras.txt/images.txt) for training to consume.
+      - Immediately starts training after COLMAP completes.
+      - Writes outputs and logs under cache/outputs/<scene_id>/sfm (logs live under sfm/logs).
   - Status label reflecting SfM progress and completion.
 - Section for splat training:
   - Controls:
-    - Backend selector (gsplat).
-    - Device selector (e.g., cuda:0).
-    - Iterations count.
-    - Snapshot interval.
-    - Batch size and training resolution.
-  - Buttons:
-    - Start Training:
-      - Begins the training loop using gsplat and PyTorch.
-    - Pause:
-      - Pauses the training loop while preserving training state.
-    - Stop:
-      - Stops the training loop and finalizes outputs.
-  - Metrics:
-    - Last iteration index.
-    - Loss.
-    - PSNR or other metrics as available.
+    - Device selector (must be CUDA; CPU training is not supported).
+    - Iterations count (default 3000) and snapshot interval (default 7000).
+    - Max points per checkpoint (0 keeps all points) and export format (ply or splat).
+    - Image downscale (default 4) and batch size.
+    - SH degree with a scheduling interval, init scale, min/max scale, opacity bias, random background toggle.
+    - Learning rates for means, scales, opacities, and SH coefficients.
+  - Training starts automatically after COLMAP via the combined button above; a live log pane streams logger output.
+  - Checkpoints land in cache/outputs/<scene_id>/splats as both .ply and .splat.
 - Live preview:
-  - Checkbox to enable or disable an OpenGL preview.
-  - When enabled:
-    - OpenGL canvas updates based on the latest `.ply` snapshot stored in splats.
-    - Camera controls support orbit, pan, and zoom.
+  - OpenGL preview is a future TODO; the current tab focuses on correct SfM + gsplat training and live logs.
 
 Exports tab:
 
@@ -366,7 +361,7 @@ ACTIVE WORK SECTION
 This section describes the expected general workflow for a robot working inside the repository.
 
 Active Work (single entry for robots):
-- None; select the next TODO before further changes.
+- None (idle; choose the next TODO before starting new work).
 
 Workflow for robot operations:
 
@@ -476,13 +471,13 @@ TODO-2 (completed): Inputs tab
     - python main.py
     - Human interacts with the grid and saves choices.
 
-TODO-3: Training tab and SfM
+TODO-3 (completed): Training tab and SfM
 
-- COLMAP and GLOMAP integration:
-  - Implement sfm_pipeline.run_sfm with real subprocess calls and log streaming.
+- COLMAP integration (COLMAP-only path):
+  - Implement sfm_pipeline.run_sfm with real subprocess calls and log streaming using COLMAP binaries.
   - Runnable step:
     - python -c "from nullsplats.backend.sfm_pipeline import run_sfm; print('sfm_pipeline import ok')"
-    - Human triggers SfM in the UI using a real dataset and inspects sfm/logs.
+    - Human triggers SfM in the UI using a real dataset and inspects sfm/logs to confirm COLMAP writes cache/outputs/<scene_id>/sfm/sparse.
 - Training configuration:
   - Implement SplatTrainingConfig for iterations and snapshot interval.
   - Runnable step:
@@ -495,6 +490,10 @@ TODO-3: Training tab and SfM
   - Runnable step:
     - python main.py
     - Human runs training for a scene and checks cache/outputs/<scene_id>/splats.
+
+Notes:
+- COLMAP feature extraction and matching run successfully on real scenes; GLOMAP is deferred to TODO-7.
+- Training now mirrors tools/gsplat_examples/simple_trainer defaults (3k iterations, save every 7k, downscale 4, log-scale export) with densify/prune via DefaultStrategy and parity in SH scheduling, LR scaling/decay, and appearance/pose options.
 
 TODO-4: OpenGL preview and Exports tab
 
@@ -553,5 +552,13 @@ TODO-6: Tests and documentation
     - Expectation to follow llms.txt and this README.
   - Runnable step:
     - None at runtime, but human review ensures consistency.
+
+TODO-7: GLOMAP integration and cuDSS alignment
+
+- GLOMAP mapper (requires working cuDSS-backed glomap.exe):
+  - Ensure glomap mapper runs end-to-end on a real scene and writes COLMAP-format outputs under cache/outputs/<scene_id>/sfm/glomap.
+  - Runnable step:
+    - glomap.exe mapper --database_path cache/outputs/<scene_id>/sfm/database.db --image_path cache/inputs/<scene_id>/frames_selected --output_path cache/outputs/<scene_id>/sfm/glomap --log_to_stderr 1 --log_level 0
+    - Human confirms cameras.txt, images.txt, and points3D.txt (or binary equivalents) exist in the output folder and reports success.
 
 End of README.

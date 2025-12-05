@@ -21,3 +21,6 @@ cache/
 # Nuitka outputs
 *.dist-info/
 *.build/
+
+tools/glomap/
+tools/COLMAP-3.7-windows-cuda/

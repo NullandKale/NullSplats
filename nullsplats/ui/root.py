@@ -50,6 +50,8 @@ def _build_tabs(root: tk.Tk, app_state: AppState, status_var: tk.StringVar) -> t
 
     def _on_scene_selected(scene_id: str) -> None:
         status_var.set(f"Active scene: {scene_id}")
+        training_tab.on_scene_changed(scene_id)
+        exports_tab.on_scene_changed(scene_id)
 
     inputs_tab = InputsTab(notebook, app_state, on_scene_selected=_on_scene_selected)
     training_tab = TrainingTab(notebook, app_state)

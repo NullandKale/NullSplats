@@ -11,8 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import json
 import subprocess
 import shutil
+import math
 from typing import Callable, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -263,6 +265,17 @@ def _extract_from_video(
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> List[FrameScore]:
     reader = FFMPEGVideoReader(str(source_file))
+    logger.info(
+        "Video reader init path=%s stream=%dx%d rotation=%d output=%dx%d fps=%.3f frames=%s",
+        source_file,
+        reader.width,
+        reader.height,
+        reader.rotation,
+        reader.output_width,
+        reader.output_height,
+        reader.fps,
+        reader.frame_count if reader.frame_count is not None else "unknown",
+    )
     total_frames = reader.frame_count if reader.frame_count is not None else candidate_count
     if total_frames is None or total_frames <= 0:
         raise ValueError(f"Video contains no frames: {source_file}")
@@ -385,30 +398,110 @@ def _save_frame_image(frame: np.ndarray, destination: Path) -> None:
     Image.fromarray(frame.astype(np.uint8)).save(destination, format="PNG")
 
 
+def _rotate_frame(frame: np.ndarray, rotation: int) -> np.ndarray:
+    """Rotate frame to honor display rotation metadata."""
+    normalized = rotation % 360
+    if normalized == 90:
+        return np.rot90(frame, k=-1)  # clockwise
+    if normalized == 180:
+        return np.rot90(frame, k=2)
+    if normalized == 270:
+        return np.rot90(frame, k=1)  # counter-clockwise
+    return frame
+
+
 def _load_image_to_array(path: Path) -> np.ndarray:
     with Image.open(path) as img:
         return np.array(img.convert("RGB"), dtype=np.uint8)
 
 
-def _ffprobe_stream_props(video_path: str) -> tuple[int, int, float, int | None]:
+def _ffprobe_stream_props(video_path: str) -> tuple[int, int, float, int | None, int]:
+    """Return width/height/fps/frame_count/rotation for the primary video stream."""
     cmd = [
         "ffprobe",
         "-v",
         "error",
         "-select_streams",
         "v:0",
-        "-show_entries",
-        "stream=width,height,r_frame_rate,nb_frames",
-        "-of",
-        "default=nokey=1:noprint_wrappers=1",
+        "-show_streams",
+        "-show_format",
+        "-print_format",
+        "json",
         video_path,
     ]
     out = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=True).stdout
-    width, height, rate, nb = out.strip().splitlines()
-    num, den = map(int, rate.split("/"))
+    logger.info("ffprobe full output for %s: %s", video_path, out)
+    info = json.loads(out)
+    streams = info.get("streams", [])
+    if not streams:
+        raise ValueError(f"No video streams found in {video_path}")
+    stream = streams[0]
+
+    width = int(stream.get("width", 0))
+    height = int(stream.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid video dimensions reported by ffprobe for {video_path}: {width}x{height}")
+    rate = stream.get("r_frame_rate", "0/1")
+    num, den = map(int, rate.split("/")) if "/" in rate else (0, 1)
     fps = num / den if den else 0.0
+    nb = str(stream.get("nb_frames", "") or "")
     frame_count = int(nb) if nb.isdigit() else None
-    return int(width), int(height), fps, frame_count
+    rotation = _extract_rotation(stream)
+    logger.info(
+        "ffprobe parsed path=%s width=%d height=%d fps=%.3f frame_count=%s rotation=%d side_data=%s tags=%s",
+        video_path,
+        width,
+        height,
+        fps,
+        frame_count if frame_count is not None else "unknown",
+        rotation,
+        stream.get("side_data_list", []),
+        stream.get("tags", {}),
+    )
+    return width, height, fps, frame_count, rotation
+
+
+def _extract_rotation(stream_info: dict) -> int:
+    """Parse rotation from ffprobe stream tags/side data, normalized to [0, 359]."""
+    rotate_tag = stream_info.get("tags", {}).get("rotate")
+    if rotate_tag is not None:
+        try:
+            return int(rotate_tag) % 360
+        except (TypeError, ValueError):
+            pass
+    for side in stream_info.get("side_data_list", []):
+        rotation_val = side.get("rotation")
+        if rotation_val is not None:
+            try:
+                return int(rotation_val) % 360
+            except (TypeError, ValueError):
+                continue
+        if "displaymatrix" in side:
+            parsed = _rotation_from_displaymatrix(side["displaymatrix"])
+            if parsed is not None:
+                return parsed
+    return 0
+
+
+def _rotation_from_displaymatrix(matrix_str: str) -> Optional[int]:
+    """Derive rotation from a display matrix text block produced by ffprobe."""
+    try:
+        lines = [line.strip() for line in matrix_str.strip().splitlines() if line.strip()]
+        values = []
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 4:
+                values.extend(parts[1:4])
+        nums = [int(val) for val in values[:4]]
+        if len(nums) < 4:
+            return None
+        a, b, c, d = nums
+        angle_rad = math.atan2(c, a)
+        angle_deg = math.degrees(angle_rad)
+        snapped = int(round(angle_deg / 90.0)) * 90
+        return snapped % 360
+    except Exception:
+        return None
 
 
 class FFMPEGVideoReader:
@@ -416,8 +509,25 @@ class FFMPEGVideoReader:
 
     def __init__(self, video_path: str, *, pix_fmt: str = "rgb24") -> None:
         self.video_path = video_path
-        self.width, self.height, self.fps, self.frame_count = _ffprobe_stream_props(video_path)
-        self.frame_size = self.width * self.height * 3
+        self.width, self.height, self.fps, self.frame_count, self.rotation = _ffprobe_stream_props(video_path)
+        # Trust ffmpeg autorotate; swap expected dimensions for 90/270.
+        if self.rotation in {90, 270}:
+            self.output_width, self.output_height = self.height, self.width
+        else:
+            self.output_width, self.output_height = self.width, self.height
+        self.frame_size = self.output_width * self.output_height * 3
+        logger.debug(
+            "FFMPEGVideoReader setup path=%s width=%d height=%d rotation=%d output_w=%d output_h=%d fps=%.3f frame_count=%s frame_size=%d",
+            video_path,
+            self.width,
+            self.height,
+            self.rotation,
+            self.output_width,
+            self.output_height,
+            self.fps,
+            self.frame_count if self.frame_count is not None else "unknown",
+            self.frame_size,
+        )
         cmd = [
             "ffmpeg",
             "-loglevel",
@@ -443,7 +553,7 @@ class FFMPEGVideoReader:
         if len(data) != self.frame_size:
             self.close()
             raise StopIteration
-        frame = np.frombuffer(data, np.uint8).reshape(self.height, self.width, 3)
+        frame = np.frombuffer(data, np.uint8).reshape(self.output_height, self.output_width, 3)
         self.idx += 1
         return frame
 

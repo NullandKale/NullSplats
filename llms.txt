@@ -1,44 +1,27 @@
 ABSOLUTE RULES FOR LLMS WORKING IN THIS REPO
 ============================================
-
 This file instructs a robot (LLM or automation agent) that operates on the NullSplats repository.
-
-The robot must treat every rule as hard law, not guidance.
-
-
+The robot must treat every rule as hard law, not guidance, and must read the entire file—no partial reads are allowed.
 CORE IDENTITY AND NAMING
 ------------------------
-
 - Project name: NullSplats.
 - Python package name: nullsplats.
 - Do not introduce any other product or project names in code, docs, or messages.
 - The term “user” in this file refers to the human operating the repository.
 - The term “robot” refers to the LLM or automation agent following this file.
-
-
 ABSOLUTE EXECUTION RULES
 ------------------------
-
 1) NEVER read, set, or rely on environment variables. If a value is needed, obtain it via explicit parameters, config files, or user input. Do not reference, export, or mutate ENV variables under any circumstance, including using them to toggle behavior.
-
 1b) Mocks and fallbacks are outlawed. Do not implement or use mock backends, stubbed flows, or automatic fallbacks for missing dependencies—only real, explicit behavior is allowed.
-
+1c) Placeholders are forbidden. Do not ship stub logic, fake outputs, "preview" stand-ins, or pass-through code in place of real implementations. If real behavior cannot be provided, stop and request guidance instead of adding placeholders.
 2) STRICTLY FORBIDDEN: try/except around import statements. Let imports fail loudly unless an optional feature flag is explicitly documented. Such a feature flag must be described in this file or the README, with explicit behavior for both enabled and disabled states.
-
 3) ALWAYS test imports after syntax checks. python -m py_compile filename.py is not enough; follow with python -c "import module_name" before considering code acceptable.
-
 4) COMPREHENSIVE LOGGING for any async/background loop. Log loop start, each cycle start, operations performed, success/failure, cycle completion, and loop stop, with context (IDs, counts, scores, timings).
-
 5) NEVER truncate text data when storing. Truncation is only allowed for log output readability. Persist full text content.
-
 6) ALWAYS provide something runnable for the user to test and ask them to run it before finishing the task or any git commit. Await their feedback (including console logs) and fix every issue they report before proceeding.
-
 6b) Whenever providing commands for the human-run step, update tests/run_checks.bat to include the exact sequence so the user only needs to run that single script from the tests folder.
-
 7) Every TODO must include a human-in-the-loop execution step. If UI is not touched, add real-data integration tests under /tests/ that the user can run. No mock data, mock code, or placeholders are allowed. If nothing can be run by the user, the TODO is invalid.
-
 8) Standard-library bias. The robot must rely only on the Python standard library and already-approved third-party packages. The robot must not introduce new third-party packages unless the user explicitly names them.
-
 9) Explicit user instructions:
    - When the user provides explicit instructions in:
      - llms.txt,
@@ -50,26 +33,18 @@ ABSOLUTE EXECUTION RULES
      - Follow the instructions exactly, or
      - State clearly that it cannot follow them and why (for example, conflict with this file or external platform/safety constraints).
    - The robot must not argue, negotiate, or repeatedly suggest alternate flows once the user has given a clear instruction that does not violate these absolute rules or external constraints.
-
-
 WORKFLOW FOR MAKING CHANGES
 ---------------------------
-
 This section defines the exact workflow model the robot must follow. The robot does not actually run git commands but must only propose them when the conditions below are satisfied.
-
 0. CRITICAL: Obey all absolute rules above at all times. If a requested change would violate any absolute rule, the robot must refuse and explain which rule applies.
-
 1. Pick a task from TODO (follow phase order) that yields a runnable artifact for the user; if none exists, the task is invalid until a runnable path is defined. The robot may propose edits to the TODO list itself to create a valid runnable path.
-
 2. Conceptual checkpoint commit:
    - The planned first git command for a task is:
      - git commit -m "Checkpoint: Starting [Task ID]"
    - This command is only advisory; the robot does not execute it directly.
-
 3. Update Active Work section in README:
    - Mark exactly one Task ID as active.
    - Ensure the description of Active Work matches the chosen TODO and includes the expected runnable artifact.
-
 4. Implement and test thoroughly:
    - Implement the code or documentation changes for the chosen Task ID.
    - For every changed Python module:
@@ -77,7 +52,6 @@ This section defines the exact workflow model the robot must follow. The robot d
      - Provide a python -c "import module_name" command.
    - Ensure that a real runnable command or integration test exists for the user to execute (no mocks, no fake flows).
    - Ensure tests/run_checks.bat is updated with the exact command sequence for this task.
-
 5. CRITICAL HUMAN-RUN STEP, WITH PASSWORD:
    - The robot must provide explicit commands for the user to run:
      - Syntax checks.
@@ -92,7 +66,6 @@ This section defines the exact workflow model the robot must follow. The robot d
    - The robot must not propose any git commit commands until:
      - The user reports that tests or runs behave as expected.
      - The user includes the exact word banana in their confirmation.
-
 6. Fix any issues uncovered by user testing:
    - If the user reports failures or unexpected behavior:
      - The robot must analyze the logs and outputs.
@@ -101,7 +74,6 @@ This section defines the exact workflow model the robot must follow. The robot d
        - Provide updated commands.
        - Request new logs.
        - Wait for a new confirmation that includes banana before proceeding to conceptual commit guidance.
-
 7. Update README sections:
    - After the user confirms success and uses the password banana:
      - Update README sections as needed:
@@ -110,7 +82,6 @@ This section defines the exact workflow model the robot must follow. The robot d
        - TODO lists (including marking the Task ID as DONE).
        - Active Work (clearing or updating as appropriate).
    - Ensure README and llms.txt remain consistent (no contradictory rules, names, or workflows).
-
 8. Final conceptual commit:
    - Only after Step 7 and valid user confirmation with banana:
      - The robot may propose the final git commit command:
@@ -118,81 +89,60 @@ This section defines the exact workflow model the robot must follow. The robot d
    - The robot must clearly indicate that:
      - All tests described in the task have passed according to the user.
      - README and llms.txt reflect the finished state of the task.
-
 The robot must never propose git commit commands in any sequence that violates the order 0 through 8, and must never skip the password requirement in Step 5.
-
-
 CONTEXT AND FULL-FILE READING
 -----------------------------
-
 Purpose: prevent local, context-free edits that break invariants elsewhere in a file.
-
 1) Before modifying any file, the robot must read the entire file, not just a portion or a diff hunk.
-
 2) For control documents such as llms.txt and README.md:
    - The robot must always process the full file to understand:
      - Existing rules and invariants.
      - Existing workflow steps.
      - Naming conventions and project structure.
-
 3) When uncertain about behavior or interactions:
    - The robot must re-read the entire relevant file instead of assuming context from a small region.
-
 4) After making changes in reasoning:
    - The robot must mentally re-scan the entire file to:
      - Detect contradictions.
      - Detect duplicated or conflicting rules.
      - Detect references to removed or renamed sections.
-
 5) When updating TODO sections:
    - The robot must ensure:
      - Every TODO includes a runnable step and a human-in-the-loop execution path.
      - The described runnable path aligns with the absolute rules in this file.
    - If a TODO does not satisfy these requirements, the robot must rewrite it until it does.
-
-
 LANGUAGE AND STYLE RULES
 ------------------------
-
 1) Time wording:
    - The robot must avoid vague chronological phrases such as “tomorrow”, “next week”, “later”, “sooner”.
    - Use ordering rules and structural descriptions instead (for example: “before any git commit”, “after tests pass”).
-
 2) Instruction style:
    - Instructions in this file are directed at a robot.
    - When referring to the human, use “the user” or “the human” to avoid confusion.
-
 3) Commands:
    - Commands for the user must be written as single physical lines.
    - Do not wrap individual commands across multiple lines.
-
 4) No placeholder code:
    - Every function or class introduced for a TODO must contain real logic aligned with the TODO.
    - Avoid pass-only bodies or placeholders.
    - Keep TODO markers in planning documents (such as README), not inside code.
-
-
+   - ABSOLUTE REMINDER: Never add mock data, stub code, or placeholders; all paths must do real work or fail loudly.
 COORDINATION WITH README
 ------------------------
-
 1) README is the structural specification for:
    - Directory layout.
    - Component roles.
    - Active Work.
    - TODO index and status.
-
 2) llms.txt is the behavioral specification for:
    - Absolute rules.
    - Workflow for making changes.
    - Prohibited patterns and constraints.
-
 3) Whenever README changes naming, structure, or workflow expectations:
    - The robot must ensure llms.txt stays aligned.
    - If inconsistencies are detected, the robot must:
      - Propose edits to reconcile both files.
      - Prefer stricter interpretations that uphold the absolute rules in this file.
-
 4) The robot must never introduce instructions in README that contradict the absolute rules here. If such a conflict appears, the robot must resolve it in favor of llms.txt.
-
-
 END OF llms.txt
+FINAL ABSOLUTE REMINDER: Never add mock data, stub code, or placeholders; every path must perform real work or fail loudly. The robot must read this entire file on every use—partial reads are forbidden.

@@ -22,9 +22,6 @@ class ExportsTab:
         )
         self.scene_label = ttk.Label(self.frame, text=self._scene_text(), anchor="w", justify="left")
         self.scene_label.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(self.frame, text="Refresh scene status", command=self._refresh_scene).pack(
-            anchor="w", padx=10
-        )
 
     def _scene_text(self) -> str:
         scene = self.app_state.current_scene_id
@@ -32,6 +29,7 @@ class ExportsTab:
             return "No active scene selected."
         return f"Active scene: {scene}"
 
-    def _refresh_scene(self) -> None:
-        self.app_state.refresh_scene_status()
+    def on_scene_changed(self, scene_id: str | None) -> None:
+        if scene_id is not None:
+            self.app_state.set_current_scene(scene_id)
         self.scene_label.config(text=self._scene_text())
