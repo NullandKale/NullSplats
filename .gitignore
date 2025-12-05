@@ -23,4 +23,5 @@ cache/
 *.build/
 
 tools/glomap/
-tools/COLMAP-3.7-windows-cuda/
+tools/colmap/
+tools/gsplat_examples/
