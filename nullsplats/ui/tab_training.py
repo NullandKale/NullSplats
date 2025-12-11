@@ -6,7 +6,11 @@ import logging
 import tkinter as tk
 from pathlib import Path
 import os
+import queue
 import shutil
+import subprocess
+import sys
+import time
 from tkinter import scrolledtext, ttk
 from typing import Optional, Tuple
 
@@ -16,6 +20,9 @@ from nullsplats.backend.io_cache import ScenePaths
 from nullsplats.backend.splat_train import SplatTrainingConfig, TrainingResult, train_scene
 from nullsplats.util.logging import get_logger
 from nullsplats.util.threading import run_in_background
+from nullsplats.ui.gl_canvas import GLCanvas
+from nullsplats.ui.advanced_render_controls import AdvancedRenderSettingsPanel
+from nullsplats.ui.render_controls import RenderSettingsPanel
 
 
 def _default_binary_path(tool: str) -> str:
@@ -41,6 +48,7 @@ class TrainingTab:
     def __init__(self, master: tk.Misc, app_state: AppState) -> None:
         self.app_state = app_state
         self.logger = get_logger("ui.training")
+        self.logger.setLevel(logging.DEBUG)
         self.frame = ttk.Frame(master)
 
         default_cfg = SplatTrainingConfig()
@@ -80,23 +88,40 @@ class TrainingTab:
         self._log_handler: Optional[logging.Handler] = None
         self._working = False
 
+        self.preview_canvas: Optional[GLCanvas] = None
+        self._last_preview_path: Optional[Path] = None
+        self._preview_cycle = 0
+        self._preview_polling = False
+        self._preview_toggle = tk.BooleanVar(value=False)
+        self._warmup_started = False
+
         self._build_contents()
         self._update_scene_label()
+        # Kick off gsplat warmup immediately so the first preview does not block Tk.
+        self.frame.after(50, lambda: self._warmup_renderer(trigger="auto"))
 
     def _build_contents(self) -> None:
-        ttk.Label(self.frame, text="Training and SfM", font=("Segoe UI", 11, "bold")).pack(
+        paned = ttk.Panedwindow(self.frame, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        left_col = ttk.Frame(paned)
+        right_col = ttk.Frame(paned)
+        paned.add(left_col, weight=1)
+        paned.add(right_col, weight=2)
+
+        ttk.Label(left_col, text="Training and SfM", font=("Segoe UI", 11, "bold")).pack(
             anchor="w", padx=10, pady=(10, 4)
         )
 
-        scene_row = ttk.Frame(self.frame)
+        scene_row = ttk.Frame(left_col)
         scene_row.pack(fill="x", padx=10, pady=(0, 6))
         self.scene_label = ttk.Label(scene_row, text=self._scene_text(), anchor="w", justify="left")
         self.scene_label.pack(side="left")
 
-        self.status_label = ttk.Label(self.frame, textvariable=self.status_var, foreground="#444")
+        self.status_label = ttk.Label(left_col, textvariable=self.status_var, foreground="#444")
         self.status_label.pack(anchor="w", padx=10, pady=(0, 8))
 
-        sfm_frame = ttk.LabelFrame(self.frame, text="Structure-from-Motion")
+        sfm_frame = ttk.LabelFrame(left_col, text="Structure-from-Motion")
         sfm_frame.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Label(
             sfm_frame,
@@ -121,8 +146,11 @@ class TrainingTab:
         sfm_buttons = ttk.Frame(sfm_frame)
         sfm_buttons.pack(fill="x", padx=6, pady=(0, 8))
         ttk.Button(sfm_buttons, text="Run COLMAP + Train", command=self._run_pipeline).pack(side="left")
+        ttk.Button(sfm_buttons, text="Warm up renderer (gsplat compile)", command=self._warmup_renderer).pack(
+            side="left", padx=(6, 0)
+        )
 
-        training_frame = ttk.LabelFrame(self.frame, text="Training loop")
+        training_frame = ttk.LabelFrame(left_col, text="Training loop")
         training_frame.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Label(
             training_frame,
@@ -253,12 +281,40 @@ class TrainingTab:
             anchor="w", padx=6, pady=(4, 4)
         )
 
-        log_frame = ttk.LabelFrame(self.frame, text="Live logs (streamed from logger)")
+        log_frame = ttk.LabelFrame(left_col, text="Live logs (streamed from logger)")
         log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.log_view = scrolledtext.ScrolledText(log_frame, wrap="none", height=16, width=110)
         self.log_view.pack(fill="both", expand=True, padx=6, pady=6)
         self.log_view.configure(state="disabled")
         self._attach_log_handler()
+
+        preview_frame = ttk.LabelFrame(right_col, text="Live preview (latest checkpoint)")
+        preview_frame.pack(fill="both", expand=True, padx=10, pady=(10, 10))
+        preview_inner = ttk.Frame(preview_frame)
+        preview_inner.pack(fill="both", expand=True, padx=6, pady=(6, 4))
+        self.preview_canvas = GLCanvas(preview_inner, device=self.device_var.get(), width=960, height=540)
+        self.preview_canvas.pack(fill="both", expand=True)
+        notebook = ttk.Notebook(preview_frame)
+        notebook.pack(fill="x", padx=6, pady=(0, 6))
+        render_tab = ttk.Frame(notebook)
+        notebook.add(render_tab, text="Render controls")
+        self.preview_controls = RenderSettingsPanel(render_tab, lambda: self.preview_canvas)
+        self.preview_controls.pack(fill="x", padx=4, pady=4)
+        advanced_tab = ttk.Frame(notebook)
+        notebook.add(advanced_tab, text="Advanced")
+        self.preview_advanced_controls = AdvancedRenderSettingsPanel(advanced_tab, lambda: self.preview_canvas)
+        self.preview_advanced_controls.pack(fill="x", padx=4, pady=4)
+        controls = ttk.Frame(preview_frame)
+        controls.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Checkbutton(
+            controls,
+            text="Enable live preview polling",
+            variable=self._preview_toggle,
+            command=self._toggle_preview_poll,
+        ).pack(side="left")
+        ttk.Button(controls, text="Refresh preview now", command=lambda: self._poll_latest_checkpoint(force=True)).pack(
+            side="right"
+        )
 
     def _scene_text(self) -> str:
         scene = self.app_state.current_scene_id
@@ -269,6 +325,7 @@ class TrainingTab:
     def on_scene_changed(self, scene_id: Optional[str]) -> None:
         if scene_id is not None:
             self.app_state.set_current_scene(scene_id)
+        self._last_preview_path = None
         self._update_scene_label()
 
     def _require_scene(self) -> Optional[str]:
@@ -362,6 +419,9 @@ class TrainingTab:
     def _handle_checkpoint(self, iteration: int, checkpoint_path: Path) -> None:
         def _update() -> None:
             self.status_var.set(f"Checkpoint {iteration}: {checkpoint_path.name}")
+            if self._preview_polling:
+                self.logger.info("Checkpoint trigger preview load for %s", checkpoint_path)
+                self._load_preview(checkpoint_path)
 
         self.frame.after(0, _update)
 
@@ -380,6 +440,171 @@ class TrainingTab:
         self.logger.exception("Training tab operation failed")
         self._set_status(f"Operation failed: {exc}", is_error=True)
 
+    def _warmup_renderer(self, trigger: str = "manual") -> None:
+        """Pre-compile gsplat rasterization in a subprocess to avoid UI blocking."""
+
+        if self._warmup_started:
+            return
+        self._warmup_started = True
+        device = self.device_var.get().strip() or "cuda:0"
+        self._set_status(f"Warmup started on {device} (subprocess, trigger={trigger}).")
+
+        def _do_warmup() -> str:
+            script = f"""
+import torch
+import json
+from pathlib import Path
+import gsplat
+from gsplat.rendering import rasterization
+
+device = torch.device("{device}")
+means = torch.zeros((1,3), device=device)
+scales = torch.zeros((1,3), device=device)
+quats = torch.tensor([[1.0,0.0,0.0,0.0]], device=device)
+opacities = torch.ones((1,), device=device) * 0.5
+colors = torch.zeros((1,1,3), device=device)
+viewmats = torch.eye(4, device=device).unsqueeze(0)
+Ks = torch.eye(3, device=device).unsqueeze(0)
+print("Warmup init: device", device, "cuda_available", torch.cuda.is_available())
+_renders, _alphas, info = rasterization(
+    means=means,
+    quats=quats,
+    scales=scales,
+    opacities=opacities,
+    colors=colors,
+    viewmats=viewmats,
+    Ks=Ks,
+    width=16,
+    height=16,
+    sh_degree=0,
+    render_mode="RGB",
+    absgrad=False,
+)
+print(json.dumps({{"render_time_ms": float(info.get("render_time_ms", 0.0))}}))
+"""
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip()
+
+        def _on_success(output: str) -> None:
+            self._set_status(f"Warmup done: {output or 'ok'}")
+
+        def _on_error(exc: Exception) -> None:
+            self.logger.exception("Renderer warmup failed")
+            self._set_status(f"Warmup failed: {exc}", is_error=True)
+
+        run_in_background(_do_warmup, tk_root=self.frame, on_success=_on_success, on_error=_on_error, thread_name="warmup_renderer")
+
+    def _toggle_preview_poll(self) -> None:
+        desired = bool(self._preview_toggle.get())
+        if desired and not self._preview_polling:
+            self._preview_polling = True
+            self.logger.info("Preview poll loop start (enabled by user)")
+            if self.preview_canvas is not None:
+                self.preview_canvas.start_rendering()
+            self._schedule_preview_poll()
+        elif not desired and self._preview_polling:
+            self._preview_polling = False
+            self.logger.info("Preview poll loop stopped (disabled by user)")
+            if self.preview_canvas is not None:
+                self.preview_canvas.stop_rendering()
+
+    def _schedule_preview_poll(self) -> None:
+        if not self._preview_polling:
+            return
+        self.frame.after(3000, self._poll_latest_checkpoint)
+
+    def _poll_latest_checkpoint(self, force: bool = False) -> None:
+        if not self._preview_polling and not force:
+            return
+        self._preview_cycle += 1
+        cycle_id = self._preview_cycle
+        scene_id = self.app_state.current_scene_id
+        self.logger.info(
+            "Preview poll cycle=%d scene=%s start force=%s polling=%s",
+            cycle_id,
+            scene_id,
+            force,
+            self._preview_polling,
+        )
+        if scene_id is None:
+            self.logger.info("Preview poll cycle=%d: no active scene set", cycle_id)
+            self._schedule_preview_poll()
+            return
+        try:
+            paths = ScenePaths(scene_id, cache_root=self.app_state.config.cache_root)
+            latest = self._latest_checkpoint(paths.splats_dir)
+            if latest is None:
+                self.logger.info("Preview poll cycle=%d scene=%s: no checkpoints found", cycle_id, scene_id)
+            elif force or latest != self._last_preview_path:
+                self.logger.debug(
+                    "Preview poll cycle=%d scene=%s: loading %s last_preview=%s",
+                    cycle_id,
+                    scene_id,
+                    latest.name,
+                    self._last_preview_path,
+                )
+                self._load_preview(latest, allow_when_disabled=force)
+            else:
+                self.logger.debug("Preview poll cycle=%d scene=%s: no new checkpoints", cycle_id, scene_id)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception("Preview poll cycle=%d scene=%s failed: %s", cycle_id, scene_id, exc)
+        finally:
+            self.logger.info("Preview poll cycle=%d scene=%s complete", cycle_id, scene_id)
+            self._schedule_preview_poll()
+
+    def _latest_checkpoint(self, splat_dir: Path) -> Optional[Path]:
+        if not splat_dir.exists():
+            return None
+        candidates = [p for p in splat_dir.iterdir() if p.suffix.lower() == ".ply"]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    def _load_preview(self, checkpoint_path: Path, *, allow_when_disabled: bool = False) -> None:
+        if self.preview_canvas is None:
+            return
+        try:
+            call_started = time.perf_counter()
+            self.logger.debug(
+                "Preview load enter path=%s allow_when_disabled=%s polling=%s",
+                checkpoint_path,
+                allow_when_disabled,
+                self._preview_polling,
+            )
+            if not self._preview_polling and not allow_when_disabled:
+                self.logger.info("Preview load skipped (polling disabled) for %s", checkpoint_path)
+                return
+            if self.preview_canvas is not None:
+                self.logger.debug("Preview load calling start_rendering path=%s", checkpoint_path)
+                self.preview_canvas.start_rendering()
+                self.logger.debug(
+                    "Preview load after start_rendering path=%s elapsed_ms=%.2f",
+                    checkpoint_path,
+                    (time.perf_counter() - call_started) * 1000.0,
+                )
+            load_start = time.perf_counter()
+            self.logger.info("Preview load calling load_splat for %s", checkpoint_path)
+            self.preview_canvas.load_splat(checkpoint_path)
+            self.logger.debug(
+                "Preview load dispatched to canvas path=%s load_elapsed_ms=%.2f total_elapsed_ms=%.2f",
+                checkpoint_path,
+                (time.perf_counter() - load_start) * 1000.0,
+                (time.perf_counter() - call_started) * 1000.0,
+            )
+            self._last_preview_path = checkpoint_path
+            self.logger.info("Preview load completed queue for %s", checkpoint_path)
+            self._set_status(f"Previewing {checkpoint_path.name}", is_error=False)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception("Failed to load preview for %s", checkpoint_path)
+            self._set_status(f"Preview load failed: {exc}", is_error=True)
+            self._preview_toggle.set(False)
+            self._preview_polling = False
+
     def _set_status(self, message: str, *, is_error: bool = False) -> None:
         self.status_var.set(message)
         if self.status_label is not None:
@@ -391,6 +616,9 @@ class TrainingTab:
             if paths.outputs_root.exists():
                 shutil.rmtree(paths.outputs_root)
             self.logger.info("Cleared outputs for scene=%s at %s", scene_id, paths.outputs_root)
+            self._last_preview_path = None
+            if self.preview_canvas is not None:
+                self.preview_canvas.clear()
             return True
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Failed to clear outputs for scene %s", scene_id)
@@ -408,20 +636,37 @@ class TrainingTab:
             def __init__(self, widget: scrolledtext.ScrolledText) -> None:
                 super().__init__()
                 self.widget = widget
+                self._queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+                # Start a flush loop on the Tk thread; emit only enqueues.
+                try:
+                    self.widget.after(50, self._flush)
+                except Exception:  # noqa: BLE001
+                    pass
 
             def emit(self, record: logging.LogRecord) -> None:
-                msg = self.format(record)
+                try:
+                    msg = self.format(record)
+                    self._queue.put_nowait(msg)
+                except Exception:  # noqa: BLE001
+                    return
 
-                def _append() -> None:
-                    if not self.widget.winfo_exists():
-                        return
+            def _flush(self) -> None:
+                if not self.widget.winfo_exists():
+                    return
+                try:
                     self.widget.configure(state="normal")
-                    self.widget.insert("end", msg + "\n")
+                    while not self._queue.empty():
+                        try:
+                            msg = self._queue.get_nowait()
+                        except Exception:  # noqa: BLE001
+                            break
+                        self.widget.insert("end", msg + "\n")
                     self.widget.see("end")
                     self.widget.configure(state="disabled")
-
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
-                    self.widget.after(0, _append)
+                    self.widget.after(50, self._flush)
                 except Exception:  # noqa: BLE001
                     pass
 

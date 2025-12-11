@@ -10,3 +10,5 @@ imageio
 tqdm
 torchmetrics
 opencv-python
+PyOpenGL
+pyopengltk

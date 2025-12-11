@@ -17,7 +17,8 @@ def setup_logging(
     *,
     log_dir: str | Path = "logs",
     log_name: str = "app.log",
-    level: int = logging.INFO,
+    level: int = logging.DEBUG,
+    console_level: int = logging.INFO,
 ) -> logging.Logger:
     """Configure application logging for console and file outputs."""
     log_dir_path = Path(log_dir)
@@ -29,19 +30,21 @@ def setup_logging(
     logger.handlers.clear()  # ensure console output is always configured
 
     formatter = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        fmt="%(asctime)s [%(levelname)s] %(name)s [%(threadName)s:%(thread)d]: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     file_path = log_dir_path / log_name
-    file_handler = logging.FileHandler(file_path, encoding="utf-8")
+    # Line-buffered stream to flush quickly for debugging slow GPU operations.
+    file_stream = file_path.open("a", encoding="utf-8", buffering=1)
+    file_handler = logging.StreamHandler(file_stream)
     file_handler.setFormatter(formatter)
     file_handler.setLevel(level)
     logger.addHandler(file_handler)
 
     console_handler = logging.StreamHandler(stream=sys.stdout)
     console_handler.setFormatter(formatter)
-    console_handler.setLevel(level)
+    console_handler.setLevel(console_level)
     logger.addHandler(console_handler)
 
     return logger
@@ -50,7 +53,9 @@ def setup_logging(
 def get_logger(name: Optional[str] = None) -> logging.Logger:
     """Return a named logger under the ``nullsplats`` namespace."""
     full_name = "nullsplats" if not name else f"nullsplats.{name}"
-    return logging.getLogger(full_name)
+    logger = logging.getLogger(full_name)
+    logger.setLevel(logging.DEBUG)
+    return logger
 
 
 __all__ = ["setup_logging", "get_logger"]

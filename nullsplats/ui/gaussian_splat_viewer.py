@@ -1,0 +1,1394 @@
+"""OpenGL Gaussian Splatting viewer widget for 3D visualization.
+
+This module provides a proper Gaussian splatting renderer that displays
+Gaussians as textured quads with shader-based falloff, embedded in Tkinter.
+"""
+
+import tkinter as tk
+from tkinter import ttk
+import numpy as np
+from typing import Optional, Dict, Tuple, List
+import logging
+import ctypes
+import math
+import os
+import json
+from pathlib import Path
+
+from OpenGL.GL import *
+from OpenGL.GLU import *
+from pyopengltk import OpenGLFrame
+OPENGL_AVAILABLE = True
+
+import torch
+TORCH_AVAILABLE = True
+# Check if CUDA is available for GPU sorting
+CUDA_AVAILABLE = torch.cuda.is_available()
+if CUDA_AVAILABLE:
+    TORCH_DEVICE = torch.device('cuda')
+else:
+    TORCH_DEVICE = torch.device('cpu')
+
+logger = logging.getLogger(__name__)
+
+
+def _look_at_matrix(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
+    """Build a right-handed look-at view matrix."""
+    forward = target - eye
+    forward = forward / (np.linalg.norm(forward) + 1e-8)
+    right = np.cross(forward, up)
+    right = right / (np.linalg.norm(right) + 1e-8)
+    true_up = np.cross(right, forward)
+
+    view = np.eye(4, dtype=np.float32)
+    view[0, :3] = right
+    view[1, :3] = true_up
+    view[2, :3] = -forward
+    view[0, 3] = -np.dot(right, eye)
+    view[1, 3] = -np.dot(true_up, eye)
+    view[2, 3] = np.dot(forward, eye)
+    return view
+
+
+class Camera:
+    """Simple camera class with direct position control."""
+    
+    def __init__(self):
+        self.position = np.array([0.0, 0.0, 5.0], dtype=np.float32)
+        self.target = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    
+    def set_position_direct(self, x, y, z):
+        """Directly set camera position in world coordinates."""
+        self.position = np.array([x, y, z], dtype=np.float32)
+    
+    def set_target_direct(self, x, y, z):
+        """Directly set where camera looks."""
+        self.target = np.array([x, y, z], dtype=np.float32)
+    
+    def get_view_matrix(self) -> np.ndarray:
+        """Create look-at view matrix."""
+        # Calculate camera axes
+        return _look_at_matrix(self.position, self.target, self.up)
+
+
+class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
+    """OpenGL-based Gaussian Splatting viewer for 3D visualization.
+    
+    Renders Gaussians as instanced quads with proper covariance projection,
+    Gaussian falloff, and alpha blending. Embedded directly in Tkinter.
+    """
+    
+    def __init__(self, parent: tk.Widget, width: int = 800, height: int = 600):
+        """Initialize the Gaussian splat viewer.
+        
+        Args:
+            parent: Parent Tkinter widget
+            width: Viewer width in pixels
+            height: Viewer height in pixels
+        """
+        self.width = width
+        self.height = height
+        
+        # Gaussian data
+        self.means = None           # (N, 3) - Gaussian centers
+        self.scales = None          # (N, 3) - Log variances (log σ²)
+        self.rotations = None       # (N, 4) - Quaternions (x,y,z,w)
+        self.opacities = None       # (N, 1) - Logit opacities
+        self.sh_dc = None           # (N, 3) - DC band of spherical harmonics
+        self.num_gaussians = 0
+        
+        # Scene bounds for auto-centering
+        self.scene_center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.scene_bounds_min = None
+        self.scene_bounds_max = None
+        self.scene_size = 1.0
+        
+        # Shader program and buffers
+        self.shader_program = None
+        self.quad_vao = None
+        self.quad_vbo = None
+        self.instance_vbo = None     # Per-instance attributes
+        
+        # Camera with proper look-at system
+        self.camera = Camera()
+        
+        # Render settings
+        self.point_scale = 1.0       # Global scale multiplier
+        self.background_color = (0.0, 0.0, 0.0, 1.0)
+        self.scale_bias = np.zeros(3, dtype=np.float32)  # Per-axis log-scale bias
+        self.opacity_bias = 0.0      # Additional logistic bias for opacity
+        
+        # Debug visualization modes
+        self.debug_mode = False       # Enable debug rendering
+        self.debug_flat_color = False # Render as flat colored quads without Gaussian falloff
+        
+        # Mouse state
+        self._last_x = 0
+        self._last_y = 0
+        self._mouse_button = None
+        
+        # Pending data upload
+        self._pending_gaussians = None
+        self._needs_data_upload = False
+        self._warned_no_gaussians = False
+
+        # Depth sorting - initially sort every frame to ensure visibility
+        self._sorted_indices = None
+        self._needs_depth_sort = True
+        self._frame_count = 0
+        self._sort_back_to_front = True
+        
+        if not OPENGL_AVAILABLE:
+            super().__init__(parent)
+            self._show_error()
+        else:
+            super().__init__(parent, width=width, height=height)
+            self.bind("<Button-1>", self._on_left_mouse_down)
+            self.bind("<Button-3>", self._on_right_mouse_down)
+            self.bind("<B1-Motion>", self._on_left_mouse_drag)
+            self.bind("<B3-Motion>", self._on_right_mouse_drag)
+            self.bind("<MouseWheel>", self._on_mouse_wheel)
+            self.bind("<ButtonRelease-1>", self._on_mouse_up)
+            self.bind("<ButtonRelease-3>", self._on_mouse_up)
+            self.animate = 1  # Enable continuous rendering
+    
+    def _show_error(self):
+        """Show error when PyOpenGL not available."""
+        error_label = ttk.Label(
+            self,
+            text="PyOpenGL not available.\n\nInstall with:\npip install PyOpenGL pyopengltk",
+            font=("TkDefaultFont", 11),
+            foreground="red",
+            justify=tk.CENTER
+        )
+        error_label.pack(expand=True)
+    
+    def initgl(self):
+        """Initialize OpenGL context and shaders."""
+        if not OPENGL_AVAILABLE:
+            return
+        
+        try:
+            logger.info("Initializing Gaussian Splat Viewer OpenGL...")
+            logger.info(f"OpenGL Version: {glGetString(GL_VERSION).decode()}")
+            logger.info(f"OpenGL Renderer: {glGetString(GL_RENDERER).decode()}")
+            
+            # Set background color
+            glClearColor(*self.background_color)
+            
+            # Configure depth testing
+            glEnable(GL_DEPTH_TEST)
+            glDepthFunc(GL_LESS)
+            glClearDepth(1.0)
+            
+            # Enable blending for alpha transparency (standard alpha blending)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glBlendEquation(GL_FUNC_ADD)
+            
+            # Disable face culling (we want to see both sides)
+            glDisable(GL_CULL_FACE)
+            
+            # Enable point sprite (if supported)
+            try:
+                glEnable(GL_POINT_SPRITE)
+                glEnable(GL_PROGRAM_POINT_SIZE)
+            except:
+                pass  # May not be available in all OpenGL versions
+            
+            # Create shader program
+            self._create_shader_program()
+            logger.info("Gaussian splat shaders created")
+            
+            # Create quad geometry (unit quad that will be instanced)
+            self._create_quad_geometry()
+            
+            # Check for OpenGL errors during initialization
+            err = glGetError()
+            if err != GL_NO_ERROR:
+                logger.error(f"OpenGL error during initialization: {err}")
+            else:
+                logger.info("Gaussian Splat Viewer OpenGL initialized successfully")
+        except Exception as e:
+            logger.exception("Failed to initialize Gaussian Splat Viewer OpenGL")
+    
+    def _create_shader_program(self):
+        """Load and compile shaders for Gaussian splatting."""
+        # Get shader directory
+        shader_dir = Path(__file__).parent / "shaders"
+        
+        # Load vertex shader
+        vert_path = shader_dir / "gaussian_splat.vert"
+        if not vert_path.exists():
+            raise FileNotFoundError(f"Vertex shader not found: {vert_path}")
+        
+        with open(vert_path, 'r') as f:
+            vertex_shader_source = f.read()
+        
+        # Load fragment shader
+        frag_path = shader_dir / "gaussian_splat.frag"
+        if not frag_path.exists():
+            raise FileNotFoundError(f"Fragment shader not found: {frag_path}")
+        
+        with open(frag_path, 'r') as f:
+            fragment_shader_source = f.read()
+        
+        # Compile vertex shader
+        vertex_shader = glCreateShader(GL_VERTEX_SHADER)
+        glShaderSource(vertex_shader, vertex_shader_source)
+        glCompileShader(vertex_shader)
+        
+        if not glGetShaderiv(vertex_shader, GL_COMPILE_STATUS):
+            error = glGetShaderInfoLog(vertex_shader).decode()
+            logger.error(f"Vertex shader compilation failed: {error}")
+            raise RuntimeError(f"Vertex shader error: {error}")
+        
+        # Compile fragment shader
+        fragment_shader = glCreateShader(GL_FRAGMENT_SHADER)
+        glShaderSource(fragment_shader, fragment_shader_source)
+        glCompileShader(fragment_shader)
+        
+        if not glGetShaderiv(fragment_shader, GL_COMPILE_STATUS):
+            error = glGetShaderInfoLog(fragment_shader).decode()
+            logger.error(f"Fragment shader compilation failed: {error}")
+            raise RuntimeError(f"Fragment shader error: {error}")
+        
+        # Link program
+        self.shader_program = glCreateProgram()
+        glAttachShader(self.shader_program, vertex_shader)
+        glAttachShader(self.shader_program, fragment_shader)
+        glLinkProgram(self.shader_program)
+        
+        if not glGetProgramiv(self.shader_program, GL_LINK_STATUS):
+            error = glGetProgramInfoLog(self.shader_program).decode()
+            logger.error(f"Shader program linking failed: {error}")
+            raise RuntimeError(f"Shader linking error: {error}")
+        
+        glDeleteShader(vertex_shader)
+        glDeleteShader(fragment_shader)
+        
+        logger.info("Gaussian splat shaders compiled successfully")
+    
+    def _create_quad_geometry(self):
+        """Create unit quad geometry for instanced rendering."""
+        # Quad vertices (2D, will be positioned by vertex shader)
+        # Two triangles forming a quad: (-1,-1) to (1,1)
+        quad_vertices = np.array([
+            # Triangle 1
+            -1.0, -1.0,
+             1.0, -1.0,
+             1.0,  1.0,
+            # Triangle 2
+            -1.0, -1.0,
+             1.0,  1.0,
+            -1.0,  1.0,
+        ], dtype=np.float32)
+        
+        # Create VAO
+        self.quad_vao = glGenVertexArrays(1)
+        glBindVertexArray(self.quad_vao)
+        
+        # Create VBO for quad vertices
+        self.quad_vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.quad_vbo)
+        glBufferData(GL_ARRAY_BUFFER, quad_vertices.nbytes, quad_vertices, GL_STATIC_DRAW)
+        
+        # Set up vertex attribute (location 0: quad_vertex)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
+        
+        # Create VBO for per-instance attributes
+        self.instance_vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.instance_vbo)
+        
+        # Set up per-instance attributes (will be filled with data later)
+        stride = (3 + 3 + 4 + 1 + 3) * 4  # mean(3) + scale(3) + rot(4) + opacity(1) + sh_dc(3)
+        
+        # Location 1: gaussian_mean (vec3)
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+        glVertexAttribDivisor(1, 1)  # Advance once per instance
+        
+        # Location 2: gaussian_scale (vec3)
+        glEnableVertexAttribArray(2)
+        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(3 * 4))
+        glVertexAttribDivisor(2, 1)
+        
+        # Location 3: gaussian_rotation (vec4)
+        glEnableVertexAttribArray(3)
+        glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(6 * 4))
+        glVertexAttribDivisor(3, 1)
+        
+        # Location 4: gaussian_opacity (float)
+        glEnableVertexAttribArray(4)
+        glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(10 * 4))
+        glVertexAttribDivisor(4, 1)
+        
+        # Location 5: gaussian_sh_dc (vec3)
+        glEnableVertexAttribArray(5)
+        glVertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(11 * 4))
+        glVertexAttribDivisor(5, 1)
+        
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        glBindVertexArray(0)
+        
+        logger.info("Quad geometry created for instanced rendering")
+    
+    def set_gaussians(self, means: np.ndarray, scales: np.ndarray,
+                     rotations: np.ndarray, opacities: np.ndarray,
+                     sh_dc: np.ndarray):
+        """Set Gaussian data for rendering.
+        
+        Args:
+            means: (N, 3) - Gaussian centers
+            scales: (N, 3) - Log variances (log σ²)
+            rotations: (N, 4) - Quaternions (x, y, z, w)
+            opacities: (N,) or (N, 1) - Logit opacities
+            sh_dc: (N, 3) - DC band of spherical harmonics (RGB)
+        """
+        if not OPENGL_AVAILABLE:
+            return
+        
+        # Validate inputs
+        n = means.shape[0]
+        if scales.shape[0] != n or rotations.shape[0] != n:
+            raise ValueError("All Gaussian parameters must have same count")
+        
+        # Ensure correct shapes
+        means = np.ascontiguousarray(means, dtype=np.float32)
+        scales = np.ascontiguousarray(scales, dtype=np.float32)
+        rotations = np.ascontiguousarray(rotations, dtype=np.float32)
+        
+        if opacities.ndim == 1:
+            opacities = opacities[:, np.newaxis]
+        opacities = np.ascontiguousarray(opacities, dtype=np.float32)
+        
+        sh_dc = np.ascontiguousarray(sh_dc, dtype=np.float32)
+        
+        # Calculate scene bounds for auto-centering
+        self.scene_bounds_min = means.min(axis=0)
+        self.scene_bounds_max = means.max(axis=0)
+        self.scene_center = (self.scene_bounds_min + self.scene_bounds_max) / 2.0
+        
+        scene_size = self.scene_bounds_max - self.scene_bounds_min
+        self.scene_size = np.max(scene_size)
+        
+        # CAMERA OUTSIDE SCENE - looking IN at center
+        # Place camera at MIN Z bound (in front), looking at center
+        cam_x = self.scene_center[0]
+        cam_y = self.scene_center[1]
+        cam_z = self.scene_bounds_min[2] - self.scene_size * 0.5  # In front of scene
+        
+        self.camera.set_position_direct(cam_x, cam_y, cam_z)
+        self.camera.set_target_direct(self.scene_center[0], self.scene_center[1], self.scene_center[2])
+        
+        logger.info("=" * 80)
+        logger.info(f"SCENE INFO:")
+        logger.info(f"  Gaussians: {n:,}")
+        logger.info(f"  Bounds: X[{self.scene_bounds_min[0]:.1f} to {self.scene_bounds_max[0]:.1f}]")
+        logger.info(f"          Y[{self.scene_bounds_min[1]:.1f} to {self.scene_bounds_max[1]:.1f}]")
+        logger.info(f"          Z[{self.scene_bounds_min[2]:.1f} to {self.scene_bounds_max[2]:.1f}]")
+        logger.info(f"  Center: ({self.scene_center[0]:.1f}, {self.scene_center[1]:.1f}, {self.scene_center[2]:.1f})")
+        logger.info(f"  Size: {self.scene_size:.1f}")
+        logger.info("CAMERA: In front of scene (at min Z - offset), looking at center")
+        logger.info(f"  Position: ({cam_x:.1f}, {cam_y:.1f}, {cam_z:.1f})")
+        logger.info(f"  Target: ({self.scene_center[0]:.1f}, {self.scene_center[1]:.1f}, {self.scene_center[2]:.1f})")
+        logger.info("=" * 80)
+        
+        # Store for later use
+        self._pending_gaussians = {
+            'means': means,
+            'scales': scales,
+            'rotations': rotations,
+            'opacities': opacities,
+            'sh_dc': sh_dc
+        }
+        self._needs_data_upload = True
+        self._needs_depth_sort = True
+        self._frame_count = 0  # Reset frame counter
+        
+        logger.info(f"Gaussian data staged for upload")
+    
+    def _upload_gaussian_data(self):
+        """Upload Gaussian data to GPU."""
+        if self._pending_gaussians is None:
+            return
+        
+        try:
+            means = self._pending_gaussians['means']
+            scales = self._pending_gaussians['scales']
+            rotations = self._pending_gaussians['rotations']
+            opacities = self._pending_gaussians['opacities']
+            sh_dc = self._pending_gaussians['sh_dc']
+            
+            n = means.shape[0]
+
+            # Interleave data: [mean(3), scale(3), rot(4), opacity(1), sh_dc(3)]
+            data = np.empty((n, 14), dtype=np.float32)
+            data[:, 0:3] = means
+            data[:, 3:6] = scales
+            data[:, 6:10] = rotations
+            data[:, 10:11] = opacities
+            data[:, 11:14] = sh_dc
+            
+            # Flatten
+            data_flat = data.flatten()
+            
+            # Upload to GPU
+            glBindBuffer(GL_ARRAY_BUFFER, self.instance_vbo)
+            glBufferData(GL_ARRAY_BUFFER, data_flat.nbytes, data_flat, GL_STATIC_DRAW)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            
+            self.num_gaussians = n
+            self._warned_no_gaussians = False
+            self.means = means
+            self.scales = scales
+            self.rotations = rotations
+            self.opacities = opacities
+            self.sh_dc = sh_dc
+            
+            self._pending_gaussians = None
+            
+            try:
+                exp_scales = np.exp(0.5 * scales)
+                alphas = 1.0 / (1.0 + np.exp(-opacities.reshape(-1)))
+            except Exception:
+                exp_scales = np.exp(scales, dtype=np.float64)
+                alphas = 1.0 / (1.0 + np.exp(-opacities.reshape(-1)))
+            scale_stats = (float(exp_scales.min()), float(exp_scales.max()), float(exp_scales.mean()))
+            opacity_stats = (float(alphas.min()), float(alphas.max()))
+            color_stats = (float(sh_dc.min()), float(sh_dc.max()))
+            logger.info(
+                "Uploaded %d Gaussians to GPU | scale_exp[min,mean,max]=[%.3g,%.3g,%.3g] "
+                "| opacity[alpha_min,max]=[%.3g,%.3g] | sh_dc[min,max]=[%.3g,%.3g]",
+                n,
+                scale_stats[0],
+                scale_stats[1],
+                scale_stats[2],
+                opacity_stats[0],
+                opacity_stats[1],
+                color_stats[0],
+                color_stats[1],
+            )
+            if scale_stats[0] < 1e-4:
+                logger.warning("Upload warning: min exp(scale) is %.3g, splats may collapse", scale_stats[0])
+            if opacity_stats[0] < 1e-3 or opacity_stats[1] > 0.999:
+                logger.warning(
+                    "Upload warning: opacity distribution is skewed [alpha_min=%.3g, alpha_max=%.3g]",
+                    opacity_stats[0],
+                    opacity_stats[1],
+                )
+        except Exception as e:
+            logger.exception("Failed to upload Gaussian data")
+            raise
+    
+    def _sort_gaussians_gpu(self, means: np.ndarray, view_matrix: np.ndarray) -> np.ndarray:
+        """Sort Gaussians on GPU using PyTorch (CUDA-accelerated) by camera depth.
+        
+        Args:
+            means: (N, 3) array of Gaussian centers
+            view_matrix: (4, 4) numpy array representing the current view transform
+            
+        Returns:
+            (N,) array of sorted indices (back to front for alpha blending)
+        """
+        # Move data to GPU
+        means_gpu = torch.from_numpy(means).to(TORCH_DEVICE)
+        view_gpu = torch.from_numpy(view_matrix[:3, :4]).to(TORCH_DEVICE)
+
+        # Compute camera coordinates using rotation + translation (view multiplies world -> camera)
+        rot = view_gpu[:, :3]
+        trans = view_gpu[:, 3]
+        cam_coords = torch.matmul(means_gpu, rot.T) + trans
+        depths = cam_coords[:, 2]
+
+        # Sort by depth (ascending for back-to-front, descending otherwise)
+        descending = not self._sort_back_to_front
+        sorted_indices = torch.argsort(depths, descending=descending)
+
+        return sorted_indices.cpu().numpy().astype(np.int32)
+    
+    def _depth_sort_gaussians(self, view_matrix: Optional[np.ndarray] = None):
+        """Sort Gaussians by depth for proper alpha blending.
+        
+        Uses GPU-accelerated sorting via PyTorch when available (CUDA),
+        falls back to CPU NumPy sorting otherwise.
+        """
+        if self.means is None or not self._needs_depth_sort:
+            return
+        
+        try:
+            import time
+            
+            if view_matrix is None:
+                view_matrix = self.camera.get_view_matrix()
+            
+            # Choose sorting method based on availability
+            sort_method = "CPU NumPy"
+            start_time = time.perf_counter()
+            
+            if TORCH_AVAILABLE and CUDA_AVAILABLE:
+                # GPU-accelerated sorting using PyTorch CUDA
+                sort_method = "GPU PyTorch (CUDA)"
+                sorted_indices = self._sort_gaussians_gpu(self.means, view_matrix)
+            elif TORCH_AVAILABLE:
+                # PyTorch available but no CUDA - still use PyTorch on CPU
+                # (may be faster than NumPy for large arrays due to optimizations)
+                sort_method = "CPU PyTorch"
+                sorted_indices = self._sort_gaussians_gpu(self.means, view_matrix)
+            else:
+                # Fallback to NumPy CPU sorting
+                # Compute distances from camera (simpler than full transform)
+                # This is approximate but much faster than full matrix multiply
+                rot = view_matrix[:3, :3]
+                trans = view_matrix[:3, 3]
+                cam_coords = self.means @ rot.T + trans
+                depths = cam_coords[:, 2]
+                sorted_indices = np.argsort(depths)
+                if not self._sort_back_to_front:
+                    sorted_indices = sorted_indices[::-1]
+                sorted_indices = sorted_indices.astype(np.int32)
+            
+            sort_time = time.perf_counter() - start_time
+            
+            # Re-upload data in sorted order
+            if self._pending_gaussians is None:
+                # Create sorted data
+                sorted_data = np.empty((self.num_gaussians, 14), dtype=np.float32)
+                sorted_data[:, 0:3] = self.means[sorted_indices]
+                sorted_data[:, 3:6] = self.scales[sorted_indices]
+                sorted_data[:, 6:10] = self.rotations[sorted_indices]
+                sorted_data[:, 10:11] = self.opacities[sorted_indices].reshape(-1, 1)
+                sorted_data[:, 11:14] = self.sh_dc[sorted_indices]
+                
+                # Upload to GPU
+                data_flat = sorted_data.flatten()
+                glBindBuffer(GL_ARRAY_BUFFER, self.instance_vbo)
+                glBufferData(GL_ARRAY_BUFFER, data_flat.nbytes, data_flat, GL_DYNAMIC_DRAW)
+                glBindBuffer(GL_ARRAY_BUFFER, 0)
+            
+            self._needs_depth_sort = False
+            
+            # Log performance information
+            logger.debug(f"Sorted {self.num_gaussians:,} Gaussians using {sort_method} in {sort_time*1000:.2f}ms ({1/sort_time:.1f} sorts/sec)")
+            
+            # Log first-time sorting method
+            if not hasattr(self, '_sort_method_logged'):
+                self._sort_method_logged = True
+                if TORCH_AVAILABLE and CUDA_AVAILABLE:
+                    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "Unknown"
+                    logger.info(f"=== GPU SORTING ENABLED ===")
+                    logger.info(f"Using CUDA device: {gpu_name}")
+                    logger.info(f"Expected speedup: 50-100x faster than CPU for large datasets")
+                elif TORCH_AVAILABLE:
+                    logger.info(f"=== CPU PyTorch SORTING ===")
+                    logger.info(f"PyTorch available but no CUDA detected")
+                    logger.info(f"Using PyTorch CPU backend (may be faster than NumPy)")
+                else:
+                    logger.info(f"=== CPU NumPy SORTING (FALLBACK) ===")
+                    logger.info(f"PyTorch not available - using NumPy CPU sorting")
+                    logger.info(f"For better performance, install PyTorch with CUDA support")
+        except Exception as e:
+            logger.exception("Failed to sort Gaussians by depth")
+    
+    def redraw(self):
+        """Render the Gaussian splat."""
+        if not OPENGL_AVAILABLE or self.shader_program is None:
+            return
+        
+        # Validate shader program is still valid (not deleted)
+        try:
+            if not glIsProgram(self.shader_program):
+                logger.warning("Shader program no longer valid, skipping render")
+                self.shader_program = None
+                return
+        except:
+            # OpenGL context may not be available
+            return
+        
+        try:
+            # Set background color
+            glClearColor(*self.background_color)
+            
+            # Upload pending data if needed
+            if self._needs_data_upload:
+                self._upload_gaussian_data()
+                self._needs_data_upload = False
+            
+            # Validate widget dimensions before sorting (needed for projection)
+            if self.width <= 0 or self.height <= 0:
+                return
+            widget_aspect = self.width / self.height
+            near_plane = self.scene_size * 0.01
+            far_plane = self.scene_size * 10.0
+            projection = self._perspective(45.0, widget_aspect, near_plane, far_plane)
+            view = self.camera.get_view_matrix()
+
+            # Depth sort (always for first few frames, then throttle)
+            self._frame_count += 1
+            if self._frame_count <= 30:
+                if self._needs_depth_sort:
+                    self._depth_sort_gaussians(view)
+            else:
+                if self._needs_depth_sort:
+                    if not hasattr(self, '_frames_since_sort'):
+                        self._frames_since_sort = 0
+                    self._frames_since_sort += 1
+
+                    if self._frames_since_sort >= 10:
+                        self._depth_sort_gaussians(view)
+                        self._frames_since_sort = 0
+
+            # DEBUG: Log first render
+            if not hasattr(self, '_debug_logged'):
+                self._debug_logged = True
+                logger.info(f"=== RENDER CONFIGURATION ===")
+                logger.info(f"Rendering {self.num_gaussians:,} Gaussians")
+                logger.info(f"Viewport: {self.width}x{self.height}")
+                logger.info(f"Near plane: {near_plane:.3f}, Far plane: {far_plane:.3f}")
+                logger.info(f"Camera position: ({self.camera.position[0]:.3f}, {self.camera.position[1]:.3f}, {self.camera.position[2]:.3f})")
+                logger.info(f"Camera target: ({self.camera.target[0]:.3f}, {self.camera.target[1]:.3f}, {self.camera.target[2]:.3f})")
+                logger.info(f"Point scale: {self.point_scale}")
+                logger.info(f"Background: {self.background_color}")
+                if self.means is not None:
+                    logger.info(f"First 3 Gaussian means:")
+                    for i in range(min(3, len(self.means))):
+                        logger.info(f"  [{i}]: ({self.means[i, 0]:.3f}, {self.means[i, 1]:.3f}, {self.means[i, 2]:.3f})")
+                logger.info(f"View matrix:\n{view}")
+                logger.info(f"Projection matrix:\n{projection}")
+                rot = view[:3, :3]
+                orthonormal = rot.T @ rot
+                if not np.allclose(orthonormal, np.eye(3), atol=1e-4):
+                    logger.warning("View rotation not orthonormal: diag=%s", np.diag(orthonormal))
+
+            # Clear buffers
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+            # Skip rendering if no data
+            if self.num_gaussians == 0:
+                if not self._warned_no_gaussians:
+                    logger.debug("No Gaussians to render (waiting for data)")
+                    self._warned_no_gaussians = True
+                return
+
+            # Use shader program
+            glUseProgram(self.shader_program)
+            
+            # Set uniforms with error checking
+            proj_loc = glGetUniformLocation(self.shader_program, "projection")
+            view_loc = glGetUniformLocation(self.shader_program, "view")
+            point_scale_loc = glGetUniformLocation(self.shader_program, "point_scale")
+            scale_bias_loc = glGetUniformLocation(self.shader_program, "scale_bias")
+            opacity_bias_loc = glGetUniformLocation(self.shader_program, "opacity_bias")
+            viewport_size_loc = glGetUniformLocation(self.shader_program, "viewport_size")
+            
+            # Verify critical uniforms (only log errors once)
+            if not hasattr(self, '_uniform_errors_logged'):
+                self._uniform_errors_logged = True
+                if proj_loc == -1:
+                    logger.error("Failed to get 'projection' uniform location")
+                if view_loc == -1:
+                    logger.error("Failed to get 'view' uniform location")
+                if point_scale_loc == -1:
+                    logger.warning("'point_scale' uniform not found (may be optimized out if unused)")
+                if scale_bias_loc == -1:
+                    logger.warning("'scale_bias' uniform not found (may be optimized out if unused)")
+                if opacity_bias_loc == -1:
+                    logger.warning("'opacity_bias' uniform not found (may be optimized out if unused)")
+                if viewport_size_loc == -1:
+                    logger.error("Failed to get 'viewport_size' uniform location")
+            
+            # Set uniform values
+            glUniformMatrix4fv(proj_loc, 1, GL_TRUE, projection)
+            glUniformMatrix4fv(view_loc, 1, GL_TRUE, view)
+            
+            logger.debug(
+                "Uniform biases: scale_bias=%s opacity_bias=%.3f",
+                self.scale_bias.tolist(),
+                self.opacity_bias,
+            )
+            # Apply debug scale multiplier if in debug mode
+            debug_scale = self.point_scale * (5.0 if self.debug_mode else 1.0)
+            glUniform1f(point_scale_loc, debug_scale)
+            if scale_bias_loc != -1:
+                glUniform3fv(scale_bias_loc, 1, self.scale_bias)
+            if opacity_bias_loc != -1:
+                glUniform1f(opacity_bias_loc, self.opacity_bias)
+            
+            # Pass viewport size
+            viewport_size = np.array([float(self.width), float(self.height)], dtype=np.float32)
+            glUniform2fv(viewport_size_loc, 1, viewport_size)
+            
+            # Ensure correct OpenGL state before drawing
+            glBindVertexArray(self.quad_vao)
+            
+            # Check OpenGL state
+            if self._frame_count == 1:
+                logger.info("=== OPENGL STATE CHECK ===")
+                logger.info(f"Depth test enabled: {glIsEnabled(GL_DEPTH_TEST)}")
+                logger.info(f"Blend enabled: {glIsEnabled(GL_BLEND)}")
+                logger.info(f"VAO bound: {self.quad_vao}")
+                logger.info(f"Drawing {self.num_gaussians:,} instances")
+            
+            # Draw instanced quads
+            glDrawArraysInstanced(GL_TRIANGLES, 0, 6, self.num_gaussians)
+            glBindVertexArray(0)
+            
+            # Unbind program
+            glUseProgram(0)
+            
+            # DEBUG: Check if anything was actually drawn
+            if not hasattr(self, '_draw_logged'):
+                self._draw_logged = True
+                # Check for OpenGL errors
+                err = glGetError()
+                if err != GL_NO_ERROR:
+                    logger.error(f"OpenGL error after draw: {err} (0x{err:04x})")
+                else:
+                    logger.info("glDrawArraysInstanced completed without GL errors")
+                
+                # Try to read a few pixels to see if anything was drawn
+                try:
+                    pixels = glReadPixels(self.width//2, self.height//2, 1, 1, GL_RGB, GL_UNSIGNED_BYTE)
+                    pixel_value = tuple(pixels[0])
+                    logger.info(f"Center pixel value: {pixel_value} (should not be (0,0,0) if something rendered)")
+                    
+                    # Sample a few more points
+                    for x, y in [(self.width//4, self.height//4), (3*self.width//4, 3*self.height//4)]:
+                        pixels = glReadPixels(x, y, 1, 1, GL_RGB, GL_UNSIGNED_BYTE)
+                        logger.info(f"Pixel at ({x},{y}): {tuple(pixels[0])}")
+                except Exception as e:
+                    logger.warning(f"Could not read pixels: {e}")
+            
+        except Exception as e:
+            logger.exception("Error during Gaussian splat rendering")
+    
+    def _perspective(self, fov: float, aspect: float, near: float, far: float) -> np.ndarray:
+        """Create perspective projection matrix."""
+        f = 1.0 / math.tan(math.radians(fov) / 2.0)
+        m = np.zeros((4, 4), dtype=np.float32)
+        m[0, 0] = f / aspect
+        m[1, 1] = f
+        m[2, 2] = (far + near) / (near - far)
+        m[2, 3] = (2 * far * near) / (near - far)
+        m[3, 2] = -1.0
+        return m
+    
+    
+    # Mouse interaction handlers
+    def _on_left_mouse_down(self, event):
+        """Handle left mouse button press (rotation)."""
+        self._last_x = event.x
+        self._last_y = event.y
+        self._mouse_button = 'left'
+    
+    def _on_right_mouse_down(self, event):
+        """Handle right mouse button press (panning)."""
+        self._last_x = event.x
+        self._last_y = event.y
+        self._mouse_button = 'right'
+    
+    def _on_left_mouse_drag(self, event):
+        """Handle left mouse drag for rotation - orbit around target."""
+        if self._mouse_button == 'left':
+            dx = event.x - self._last_x
+            dy = event.y - self._last_y
+            
+            to_camera = self.camera.position - self.camera.target
+            distance = np.linalg.norm(to_camera)
+            if distance < 1e-5:
+                return
+
+            sensitivity = 0.005
+            yaw = math.atan2(to_camera[0], to_camera[2])
+            pitch = math.asin(np.clip(to_camera[1] / distance, -0.999, 0.999))
+
+            yaw -= dx * sensitivity
+            pitch = np.clip(pitch + dy * sensitivity, -math.pi / 2 + 0.01, math.pi / 2 - 0.01)
+
+            cos_pitch = math.cos(pitch)
+            sin_pitch = math.sin(pitch)
+            sin_yaw = math.sin(yaw)
+            cos_yaw = math.cos(yaw)
+
+            new_offset = np.array([
+                distance * cos_pitch * sin_yaw,
+                distance * sin_pitch,
+                distance * cos_pitch * cos_yaw,
+            ], dtype=np.float32)
+
+            self.camera.position = self.camera.target + new_offset
+            self.camera.up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            
+            self._last_x = event.x
+            self._last_y = event.y
+            self._needs_depth_sort = True
+            logger.info("Orbit change -> camera pos=%s target=%s", tuple(self.camera.position.tolist()), tuple(self.camera.target.tolist()))
+    
+    def _on_right_mouse_drag(self, event):
+        """Handle right mouse drag for panning."""
+        if self._mouse_button == 'right':
+            dx = event.x - self._last_x
+            dy = event.y - self._last_y
+            
+            pan_speed = self.scene_size * 0.001
+            view = self.camera.get_view_matrix()
+            right = view[0, :3]
+            up = view[1, :3]
+
+            offset = right * dx * pan_speed - up * dy * pan_speed
+            self.camera.target += offset
+            self.camera.position += offset
+            
+            self._last_x = event.x
+            self._last_y = event.y
+            self._needs_depth_sort = True
+            logger.info("Pan change -> camera pos=%s target=%s", tuple(self.camera.position.tolist()), tuple(self.camera.target.tolist()))
+    
+    def _on_mouse_up(self, event):
+        """Handle mouse button release."""
+        self._mouse_button = None
+    
+    def _on_mouse_wheel(self, event):
+        """Handle mouse wheel for zoom - move camera toward/away from target."""
+        # Get direction from camera to target
+        to_target = self.camera.target - self.camera.position
+        distance = np.linalg.norm(to_target)
+        direction = to_target / (distance + 1e-8)
+        
+        # Zoom in/out
+        if event.delta > 0:
+            # Zoom in
+            self.camera.position += direction * distance * 0.1
+        else:
+            # Zoom out
+            self.camera.position -= direction * distance * 0.1
+        
+        self._needs_depth_sort = True
+        logger.info("Zoom change -> camera pos=%s target=%s", tuple(self.camera.position.tolist()), tuple(self.camera.target.tolist()))
+    
+    # Settings
+    def set_point_scale(self, scale: float):
+        """Set global point scale multiplier."""
+        if not OPENGL_AVAILABLE:
+            return
+        self.point_scale = max(0.1, min(10.0, scale))
+
+    def set_scale_bias(self, bias):
+        """Apply per-axis log-scale bias before exponentiation."""
+        if not OPENGL_AVAILABLE:
+            return
+        arr = np.ascontiguousarray(bias, dtype=np.float32)
+        if arr.shape != (3,):
+            raise ValueError("scale_bias must be an iterable of three floats")
+        self.scale_bias = arr
+        self._needs_depth_sort = True
+
+    def set_opacity_bias(self, bias: float):
+        """Adjust the sigmoid bias applied to each Gaussian's opacity."""
+        if not OPENGL_AVAILABLE:
+            return
+        self.opacity_bias = float(bias)
+        self._needs_depth_sort = True
+
+    def set_sort_back_to_front(self, value: bool):
+        """Toggle whether Gaussians are sorted back-to-front or front-to-back."""
+        if not OPENGL_AVAILABLE:
+            return
+        self._sort_back_to_front = value
+        self._needs_depth_sort = True
+
+    def request_depth_sort(self):
+        """Force the viewer to re-sort Gaussians on the next redraw."""
+        if not OPENGL_AVAILABLE:
+            return
+        self._needs_depth_sort = True
+    
+    def set_debug_mode(self, enabled: bool):
+        """Enable debug rendering mode (larger splats for visibility)."""
+        if not OPENGL_AVAILABLE:
+            return
+        self.debug_mode = enabled
+        logger.info(f"Debug mode: {'ENABLED' if enabled else 'DISABLED'}")
+        if enabled:
+            logger.info("Debug mode increases splat size by 5x for visibility")
+    
+    def set_debug_flat_color(self, enabled: bool):
+        """Enable flat color rendering (no Gaussian falloff)."""
+        if not OPENGL_AVAILABLE:
+            return
+        self.debug_flat_color = enabled
+        logger.info(f"Flat color debug: {'ENABLED' if enabled else 'DISABLED'}")
+    
+    def set_background_color(self, color: str):
+        """Set background color."""
+        if not OPENGL_AVAILABLE:
+            return
+        
+        color_map = {
+            'black': (0.0, 0.0, 0.0, 1.0),
+            'white': (1.0, 1.0, 1.0, 1.0),
+            'gray': (0.5, 0.5, 0.5, 1.0)
+        }
+        self.background_color = color_map.get(color, (0.0, 0.0, 0.0, 1.0))
+    
+    def stop_rendering(self):
+        """Stop the render loop to reduce GPU usage."""
+        if OPENGL_AVAILABLE:
+            self.animate = 0
+            logger.info("Gaussian splat viewer rendering stopped")
+    
+    def start_rendering(self):
+        """Start the render loop."""
+        if OPENGL_AVAILABLE:
+            self.animate = 1
+            logger.info("Gaussian splat viewer rendering started")
+    
+    def set_camera_pose(self, position: np.ndarray, rotation: Optional[np.ndarray] = None, target: Optional[np.ndarray] = None):
+        """Set camera to specific position with optional rotation or target.
+        
+        Args:
+            position: (3,) array of camera position in world coordinates
+            rotation: (3, 3) rotation matrix from world-to-camera (optional)
+            target: (3,) array of camera target (optional, used if rotation not provided)
+        """
+        if not OPENGL_AVAILABLE:
+            return
+        
+        self.camera.set_position_direct(position[0], position[1], position[2])
+        
+        if rotation is not None:
+            # Rotation matrix is world-to-camera (R in [R|t] extrinsic)
+            # Camera-to-world rotation is the transpose
+            R_T = rotation.T
+            
+            # Camera looks along +Z in camera space for COLMAP-like data
+            forward_cam = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            forward_world = R_T @ forward_cam
+            
+            # Target is position + forward direction
+            target_pos = position + forward_world
+            final_target = target_pos if target is None else target
+            self.camera.set_target_direct(final_target[0], final_target[1], final_target[2])
+            
+            # Set camera up vector (camera up is +Y in camera space)
+            up_cam = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            up_world = R_T @ up_cam
+            self.camera.up = up_world
+            
+            logger.info(
+                "Camera set with rotation - position: (%.2f, %.2f, %.2f), target: (%.2f, %.2f, %.2f)",
+                position[0],
+                position[1],
+                position[2],
+                final_target[0],
+                final_target[1],
+                final_target[2],
+            )
+        elif target is not None:
+            self.camera.set_target_direct(target[0], target[1], target[2])
+            logger.info(f"Camera set with target - position: ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}), target: ({target[0]:.2f}, {target[1]:.2f}, {target[2]:.2f})")
+        else:
+            # Look at scene center by default
+            self.camera.set_target_direct(
+                self.scene_center[0],
+                self.scene_center[1],
+                self.scene_center[2]
+            )
+            logger.info(f"Camera set to scene center - position: ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
+        
+        # Trigger depth sort for new viewpoint
+        self._needs_depth_sort = True
+    
+    def load_camera_poses(self, pose_file_or_directory: str) -> List[Dict]:
+        """Load camera poses from reconstruction output.
+        
+        Supports:
+        - COLMAP binary format (cameras.bin, images.bin)
+        - COLMAP text format (cameras.txt, images.txt)
+        - NeRF-style transforms.json
+        - Directory containing any of the above
+        
+        Args:
+            pose_file_or_directory: Path to pose file or directory containing camera data
+            
+        Returns:
+            List of camera pose dictionaries with keys:
+                - 'position': (3,) camera position
+                - 'rotation': (3, 3) rotation matrix
+                - 'quaternion': (4,) quaternion (w, x, y, z)
+                - 'intrinsics': (3, 3) camera intrinsics (if available)
+                - 'name': image/camera name
+        """
+        path = Path(pose_file_or_directory)
+        
+        if not path.exists():
+            logger.error(f"Camera pose path does not exist: {path}")
+            return []
+        
+        # If directory, try to find camera files
+        if path.is_dir():
+            # Try COLMAP binary format
+            if (path / "cameras.bin").exists() and (path / "images.bin").exists():
+                logger.info(f"Found COLMAP binary format in {path}")
+                return self._load_colmap_binary(path)
+            # Try COLMAP text format
+            elif (path / "cameras.txt").exists() and (path / "images.txt").exists():
+                logger.info(f"Found COLMAP text format in {path}")
+                return self._load_colmap_text(path)
+            # Try NeRF transforms.json
+            elif (path / "transforms.json").exists():
+                logger.info(f"Found NeRF transforms.json in {path}")
+                return self._load_nerf_transforms(path / "transforms.json")
+            else:
+                logger.error(f"No recognized camera pose format found in {path}")
+                return []
+        else:
+            # Single file
+            if path.name == "transforms.json":
+                return self._load_nerf_transforms(path)
+            elif path.name.startswith("cameras") or path.name.startswith("images"):
+                # Could be COLMAP format
+                parent = path.parent
+                if path.suffix == ".bin":
+                    return self._load_colmap_binary(parent)
+                else:
+                    return self._load_colmap_text(parent)
+            else:
+                logger.error(f"Unrecognized camera pose file format: {path}")
+                return []
+    
+    def _load_colmap_binary(self, directory: Path) -> List[Dict]:
+        """Load camera poses from COLMAP binary format."""
+        try:
+            # Import COLMAP reading utilities
+            import sys
+            from pathlib import Path
+            
+            # Add src to path if needed
+            src_path = Path(__file__).parent.parent.parent.parent / "src"
+            if str(src_path) not in sys.path:
+                sys.path.insert(0, str(src_path))
+            
+            from depth_anything_3.utils.read_write_model import read_cameras_binary, read_images_binary
+            
+            cameras_file = directory / "cameras.bin"
+            images_file = directory / "images.bin"
+            
+            cameras = read_cameras_binary(str(cameras_file))
+            images = read_images_binary(str(images_file))
+            
+            logger.info(f"Loaded {len(cameras)} cameras and {len(images)} images from COLMAP binary")
+            
+            return self._parse_colmap_data(cameras, images)
+        except Exception as e:
+            logger.exception(f"Failed to load COLMAP binary format: {e}")
+            return []
+    
+    def _load_colmap_text(self, directory: Path) -> List[Dict]:
+        """Load camera poses from COLMAP text format."""
+        try:
+            import sys
+            from pathlib import Path
+            
+            # Add src to path if needed
+            src_path = Path(__file__).parent.parent.parent.parent / "src"
+            if str(src_path) not in sys.path:
+                sys.path.insert(0, str(src_path))
+            
+            from depth_anything_3.utils.read_write_model import read_cameras_text, read_images_text
+            
+            cameras_file = directory / "cameras.txt"
+            images_file = directory / "images.txt"
+            
+            cameras = read_cameras_text(str(cameras_file))
+            images = read_images_text(str(images_file))
+            
+            logger.info(f"Loaded {len(cameras)} cameras and {len(images)} images from COLMAP text")
+            
+            return self._parse_colmap_data(cameras, images)
+        except Exception as e:
+            logger.exception(f"Failed to load COLMAP text format: {e}")
+            return []
+    
+    def _parse_colmap_data(self, cameras: Dict, images: Dict) -> List[Dict]:
+        """Parse COLMAP camera and image data into pose list."""
+        poses = []
+        
+        for img_id, img in images.items():
+            # Get camera intrinsics
+            camera = cameras.get(img.camera_id)
+            
+            # COLMAP uses quaternion (w, x, y, z) and translation for world-to-camera
+            qvec = img.qvec  # (w, x, y, z) in COLMAP format
+            tvec = img.tvec  # translation
+            
+            # Convert quaternion to rotation matrix
+            R = self._quat_to_rotation_matrix(qvec)
+            
+            # COLMAP format is world-to-camera, we need camera-to-world
+            # C = -R^T * t (camera position in world coordinates)
+            camera_pos = -R.T @ tvec
+            camera_rot = R.T  # Camera-to-world rotation
+            
+            pose = {
+                'name': img.name,
+                'position': camera_pos.astype(np.float32),
+                'rotation': camera_rot.astype(np.float32),
+                'quaternion': qvec.astype(np.float32),
+                'image_id': img_id,
+                'camera_id': img.camera_id
+            }
+            
+            # Add intrinsics if available
+            if camera is not None:
+                # Build intrinsics matrix
+                params = camera.params
+                if camera.model in ['PINHOLE', 'SIMPLE_PINHOLE']:
+                    fx = params[0] if camera.model == 'SIMPLE_PINHOLE' else params[0]
+                    fy = params[0] if camera.model == 'SIMPLE_PINHOLE' else params[1]
+                    cx = params[1] if camera.model == 'SIMPLE_PINHOLE' else params[2]
+                    cy = params[2] if camera.model == 'SIMPLE_PINHOLE' else params[3]
+                    
+                    K = np.array([
+                        [fx, 0, cx],
+                        [0, fy, cy],
+                        [0, 0, 1]
+                    ], dtype=np.float32)
+                    pose['intrinsics'] = K
+                    pose['width'] = camera.width
+                    pose['height'] = camera.height
+            
+            poses.append(pose)
+        
+        logger.info(f"Parsed {len(poses)} camera poses from COLMAP data")
+        return poses
+    
+    def _load_nerf_transforms(self, transforms_file: Path) -> List[Dict]:
+        """Load camera poses from NeRF-style transforms.json."""
+        try:
+            with open(transforms_file, 'r') as f:
+                data = json.load(f)
+            
+            poses = []
+            camera_angle_x = data.get('camera_angle_x', None)
+            
+            for frame in data.get('frames', []):
+                # NeRF uses a 4x4 transform matrix (camera-to-world)
+                transform_matrix = np.array(frame['transform_matrix'], dtype=np.float32)
+                
+                # Extract rotation (top-left 3x3) and translation (top-right 3x1)
+                rotation = transform_matrix[:3, :3]
+                position = transform_matrix[:3, 3]
+                
+                # DEBUG: Log first few camera positions
+                if len(poses) < 3:
+                    logger.info(f"[CAMERA LOAD DEBUG] Frame {len(poses)}: position=({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
+                
+                # Convert rotation to quaternion
+                quat = self._rotation_matrix_to_quat(rotation)
+                
+                pose = {
+                    'name': frame.get('file_path', f"frame_{len(poses)}"),
+                    'position': position,
+                    'rotation': rotation,
+                    'quaternion': quat,
+                }
+                
+                # Add intrinsics if we have camera_angle_x
+                if camera_angle_x is not None and 'w' in frame and 'h' in frame:
+                    width = frame['w']
+                    height = frame['h']
+                    fx = width / (2 * np.tan(camera_angle_x / 2))
+                    fy = fx  # Assume square pixels
+                    cx = width / 2
+                    cy = height / 2
+                    
+                    K = np.array([
+                        [fx, 0, cx],
+                        [0, fy, cy],
+                        [0, 0, 1]
+                    ], dtype=np.float32)
+                    pose['intrinsics'] = K
+                    pose['width'] = width
+                    pose['height'] = height
+                
+                poses.append(pose)
+            
+            logger.info(f"Loaded {len(poses)} camera poses from NeRF transforms.json")
+            return poses
+        except Exception as e:
+            logger.exception(f"Failed to load NeRF transforms.json: {e}")
+            return []
+    
+    def _quat_to_rotation_matrix(self, quat: np.ndarray) -> np.ndarray:
+        """Convert quaternion to rotation matrix.
+        
+        Args:
+            quat: Quaternion in (w, x, y, z) format
+            
+        Returns:
+            3x3 rotation matrix
+        """
+        w, x, y, z = quat
+        
+        R = np.array([
+            [1 - 2*(y**2 + z**2), 2*(x*y - w*z), 2*(x*z + w*y)],
+            [2*(x*y + w*z), 1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
+            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x**2 + y**2)]
+        ], dtype=np.float32)
+        
+        return R
+    
+    def _rotation_matrix_to_quat(self, R: np.ndarray) -> np.ndarray:
+        """Convert rotation matrix to quaternion.
+        
+        Args:
+            R: 3x3 rotation matrix
+            
+        Returns:
+            Quaternion in (w, x, y, z) format
+        """
+        trace = np.trace(R)
+        
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (R[2, 1] - R[1, 2]) * s
+            y = (R[0, 2] - R[2, 0]) * s
+            z = (R[1, 0] - R[0, 1]) * s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+        
+        return np.array([w, x, y, z], dtype=np.float32)
+    
+    def set_camera_from_pose(self, position: np.ndarray, rotation: np.ndarray = None,
+                            look_at: np.ndarray = None, distance_offset: float = 0.0):
+        """Set camera position and orientation from pose data.
+        
+        Args:
+            position: (3,) camera position in world coordinates
+            rotation: (3, 3) rotation matrix (camera-to-world), optional
+            look_at: (3,) point to look at, used if rotation not provided
+            distance_offset: Additional distance to move camera back along viewing direction
+        """
+        if not OPENGL_AVAILABLE:
+            return
+        
+        # Log the camera position being set
+        logger.info(f"[VIEWER DEBUG] Setting camera from pose:")
+        logger.info(f"  Camera position: ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
+        logger.info(f"  Scene center: ({self.scene_center[0]:.2f}, {self.scene_center[1]:.2f}, {self.scene_center[2]:.2f})")
+        logger.info(f"  Scene bounds: X[{self.scene_bounds_min[0]:.1f} to {self.scene_bounds_max[0]:.1f}], "
+                   f"Y[{self.scene_bounds_min[1]:.1f} to {self.scene_bounds_max[1]:.1f}], "
+                   f"Z[{self.scene_bounds_min[2]:.1f} to {self.scene_bounds_max[2]:.1f}]")
+        
+        # Set camera position
+        self.camera.set_position_direct(position[0], position[1], position[2])
+        
+        # Determine where camera should look
+        if rotation is not None:
+            # Correct orientation determined through testing: Forward=+Z, Up=-Y
+            forward = rotation[:, 2]  # Positive Z column = forward direction
+            
+            # Apply distance offset if specified
+            if distance_offset != 0.0:
+                self.camera.position -= forward * distance_offset
+            
+            # Calculate target - use forward vector scaled by distance to scene
+            to_scene = self.scene_center - self.camera.position
+            scene_distance = np.linalg.norm(to_scene)
+            
+            # Look along forward vector, scaled by distance to scene
+            look_distance = max(scene_distance, 1.0)
+            target = self.camera.position + forward * look_distance
+            
+            self.camera.set_target_direct(target[0], target[1], target[2])
+            
+            # Update up vector: Negative Y column
+            self.camera.up = -rotation[:, 1]
+            
+        elif look_at is not None:
+            # Explicitly provided look-at point
+            self.camera.set_target_direct(look_at[0], look_at[1], look_at[2])
+        else:
+            # Default: look at scene center
+            self.camera.set_target_direct(
+                self.scene_center[0],
+                self.scene_center[1],
+                self.scene_center[2]
+            )
+        
+        # Trigger depth re-sort
+        self._needs_depth_sort = True
+        
+        logger.info(f"Camera set from pose: pos=({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}), "
+                   f"target=({self.camera.target[0]:.2f}, {self.camera.target[1]:.2f}, {self.camera.target[2]:.2f})")
+    
+    def stop_rendering(self):
+        """Stop the render loop."""
+        if OPENGL_AVAILABLE:
+            self.animate = 0
+            logger.info("Gaussian splat viewer rendering stopped")
+    
+    def start_rendering(self):
+        """Start the render loop."""
+        if OPENGL_AVAILABLE:
+            self.animate = 1
+            logger.info("Gaussian splat viewer rendering started")
+    
+    def destroy(self):
+        """Override destroy to ensure proper cleanup."""
+        logger.info("Destroying GaussianSplatViewer widget")
+        try:
+            # Clear OpenGL resources first
+            self.clear()
+        except Exception as e:
+            logger.warning(f"Error during destroy cleanup: {e}")
+        finally:
+            # Call parent destroy
+            super().destroy()
+    
+    def clear(self):
+        """Clear the viewer and release resources."""
+        if OPENGL_AVAILABLE:
+            try:
+                self.animate = 0  # Stop rendering
+                
+                # Delete shader program first
+                if self.shader_program and glIsProgram(self.shader_program):
+                    glDeleteProgram(self.shader_program)
+                    logger.info("Deleted Gaussian splat shader program")
+                
+                if self.quad_vao:
+                    glDeleteVertexArrays(1, [self.quad_vao])
+                if self.quad_vbo:
+                    glDeleteBuffers(1, [self.quad_vbo])
+                if self.instance_vbo:
+                    glDeleteBuffers(1, [self.instance_vbo])
+            except Exception as e:
+                logger.warning(f"Error during Gaussian splat cleanup: {e}")
+            
+            # Clear all references
+            self.shader_program = None
+            self.quad_vao = None
+            self.quad_vbo = None
+            self.instance_vbo = None
+            self.num_gaussians = 0

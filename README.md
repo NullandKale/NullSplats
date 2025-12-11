@@ -361,7 +361,7 @@ ACTIVE WORK SECTION
 This section describes the expected general workflow for a robot working inside the repository.
 
 Active Work (single entry for robots):
-- None (idle; choose the next TODO before starting new work).
+- TODO-4 — OpenGL preview and Exports tab with runnable UI preview and export commands.
 
 Workflow for robot operations:
 
