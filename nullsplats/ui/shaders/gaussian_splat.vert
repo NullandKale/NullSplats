@@ -44,9 +44,9 @@ void main() {
         2.0 * (qx*qz - qw*qy), 2.0 * (qy*qz + qw*qx), 1.0 - 2.0 * (qx*qx + qy*qy)
     );
     
-    // Build scale matrix (scales ARE stored as log in PLY, must exponentiate)
+    // Build scale matrix (PLY stores log standard deviations per axis)
     // Apply point_scale multiplier for user control
-    vec3 exp_scale = exp((scale + scale_bias) * 0.5) * point_scale;
+    vec3 exp_scale = exp(scale + scale_bias) * point_scale;
     mat3 S = mat3(
         exp_scale.x, 0.0, 0.0,
         0.0, exp_scale.y, 0.0,
@@ -95,8 +95,8 @@ void main() {
     );
     
     // Add a small value to diagonal for numerical stability
-    cov2d[0][0] += 0.3;
-    cov2d[1][1] += 0.3;
+    cov2d[0][0] += 1e-4;
+    cov2d[1][1] += 1e-4;
     
     // Compute determinant and inverse of 2D covariance
     float det = cov2d[0][0] * cov2d[1][1] - cov2d[0][1] * cov2d[1][0];

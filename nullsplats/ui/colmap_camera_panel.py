@@ -29,43 +29,46 @@ class ColmapCameraPose:
 
 
 class ColmapCameraPanel(ttk.LabelFrame):
-    """Show cached COLMAP pose list and push a selected pose to the viewer."""
+    """Compact COLMAP camera playback: play/pause through poses as a path."""
 
     def __init__(
         self,
         master: tk.Misc,
         viewer_getter: Callable[[], Optional[object]],
         scene_getter: Callable[[], Optional[SceneId | str]],
-        cache_root_getter: Callable[[], Path],
+        paths_getter: Callable[[str], ScenePaths],
     ):
         super().__init__(master, text="COLMAP cameras")
         self.viewer_getter = viewer_getter
         self.scene_getter = scene_getter
-        self.cache_root_getter = cache_root_getter
+        self.paths_getter = paths_getter
         self._poses: List[ColmapCameraPose] = []
         self._current_pose_idx: Optional[int] = None
+        self._playing = False
+        self._play_job: Optional[str] = None
+        self._play_interval_ms = 1200
 
         toolbar = ttk.Frame(self)
         toolbar.pack(fill="x", padx=4, pady=(4, 0))
-        ttk.Label(toolbar, text="Reveal COLMAP camera poses used during training.").pack(
-            side="left", padx=(0, 4)
-        )
-        ttk.Button(toolbar, text="Refresh cameras", command=self._load_cameras).pack(side="right")
+        ttk.Label(toolbar, text="Playback COLMAP poses").pack(side="left", padx=(0, 4))
+        ttk.Button(toolbar, text="Refresh", command=self._load_cameras, width=10).pack(side="right")
 
         tree_frame = ttk.Frame(self)
-        tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        tree_frame.pack(fill="both", expand=True, padx=4, pady=(2, 4))
 
         self._tree = ttk.Treeview(
             tree_frame,
-            columns=("camera", "position"),
+            columns=("camera", "position", "distance"),
             show="headings",
             selectmode="browse",
-            height=6,
+            height=5,
         )
         self._tree.heading("camera", text="Image / camera")
         self._tree.heading("position", text="Position (X,Y,Z)")
+        self._tree.heading("distance", text="Dist to center")
         self._tree.column("camera", width=180)
-        self._tree.column("position", width=220)
+        self._tree.column("position", width=180)
+        self._tree.column("distance", width=110)
         self._tree.pack(side="left", fill="both", expand=True)
         self._tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
@@ -75,9 +78,12 @@ class ColmapCameraPanel(ttk.LabelFrame):
 
         action_frame = ttk.Frame(self)
         action_frame.pack(fill="x", padx=4, pady=(0, 4))
-        ttk.Button(action_frame, text="Previous camera", command=self._prev_pose).pack(side="left")
-        ttk.Button(action_frame, text="Use selected pose", command=self._apply_current_pose).pack(side="left", padx=(4, 4))
-        ttk.Button(action_frame, text="Next camera", command=self._next_pose).pack(side="left")
+        ttk.Button(action_frame, text="Prev", command=self._prev_pose, width=7).pack(side="left")
+        self._play_btn = ttk.Button(action_frame, text="Play", command=self._toggle_playback, width=7)
+        self._play_btn.pack(side="left", padx=(4, 4))
+        ttk.Button(action_frame, text="Next", command=self._next_pose, width=7).pack(side="left")
+        ttk.Button(action_frame, text="Apply", command=self._apply_current_pose, width=8).pack(side="left", padx=(6, 4))
+        ttk.Button(action_frame, text="Recenter", command=self._recenter_to_scene, width=9).pack(side="left")
         self._status_var = tk.StringVar(value="No COLMAP cameras loaded.")
         ttk.Label(action_frame, textvariable=self._status_var).pack(side="right")
         self.after(0, self._load_cameras)
@@ -87,8 +93,7 @@ class ColmapCameraPanel(ttk.LabelFrame):
         if scene_id is None:
             self._status_var.set("Select a scene before loading cameras.")
             return
-        cache_root = self.cache_root_getter()
-        paths = ScenePaths(scene_id, cache_root=cache_root)
+        paths = self.paths_getter(str(scene_id))
         images_file = self._find_images_file(paths.sfm_dir)
         if images_file is None:
             self._status_var.set("COLMAP images.txt not found for this scene.")
@@ -97,14 +102,16 @@ class ColmapCameraPanel(ttk.LabelFrame):
 
         self._poses = _parse_images_file(images_file)
         self._tree.delete(*self._tree.get_children())
+        center = self._scene_center()
         for idx, pose in enumerate(self._poses):
             label = f"{pose.name} ({pose.image_id})"
             pos_text = f"{pose.position[0]:.2f}, {pose.position[1]:.2f}, {pose.position[2]:.2f}"
-            self._tree.insert("", "end", iid=str(idx), values=(label, pos_text))
+            dist = np.linalg.norm(pose.position - center) if center is not None else float("nan")
+            dist_text = f"{dist:.2f}" if np.isfinite(dist) else "–"
+            self._tree.insert("", "end", iid=str(idx), values=(label, pos_text, dist_text))
         self._status_var.set(f"Loaded {len(self._poses)} COLMAP cameras.")
 
         # Try to pick camera closest to scene center
-        center = self._scene_center()
         if center is not None and self._poses:
             self._current_pose_idx = min(
                 range(len(self._poses)),
@@ -141,6 +148,11 @@ class ColmapCameraPanel(ttk.LabelFrame):
             return
         try:
             viewer.set_camera_pose(pose.position, rotation=pose.rotation)
+            if hasattr(viewer, "render_once"):
+                try:
+                    viewer.render_once()
+                except Exception:
+                    pass
             self._status_var.set(f"Applied pose: {pose.name}")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to apply COLMAP camera pose")
@@ -177,6 +189,7 @@ class ColmapCameraPanel(ttk.LabelFrame):
         self._tree.see(str(idx))
         self._status_var.set(f"Applying pose: {pose.name}")
         self._apply_selected_pose()
+        self._current_pose_idx = idx
 
     def _select_pose(self, idx: Optional[int]) -> None:
         self._tree.selection_remove(self._tree.selection())
@@ -188,6 +201,62 @@ class ColmapCameraPanel(ttk.LabelFrame):
         if viewer is None or not hasattr(viewer, "get_scene_center"):
             return None
         return viewer.get_scene_center()
+
+    def _recenter_to_scene(self) -> None:
+        viewer = self.viewer_getter()
+        if viewer is None or not hasattr(viewer, "recenter_camera"):
+            self._status_var.set("Viewer not ready.")
+            return
+        try:
+            viewer.recenter_camera()
+            if hasattr(viewer, "render_once"):
+                try:
+                    viewer.render_once()
+                except Exception:
+                    pass
+            self._status_var.set("Camera recentered to scene.")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to recenter camera")
+            self._status_var.set(f"Recenter failed: {exc}")
+
+    def _toggle_playback(self) -> None:
+        if self._playing:
+            self._stop_playback()
+        else:
+            self._start_playback()
+
+    def _start_playback(self) -> None:
+        if not self._poses:
+            self._status_var.set("Load cameras before playback.")
+            return
+        self._playing = True
+        self._play_btn.config(text="Pause")
+        if self._current_pose_idx is None:
+            self._current_pose_idx = 0
+        self._queue_next_frame()
+        self._status_var.set("Playing camera path...")
+
+    def _stop_playback(self) -> None:
+        self._playing = False
+        self._play_btn.config(text="Play")
+        if self._play_job is not None:
+            try:
+                self.after_cancel(self._play_job)
+            except Exception:
+                pass
+            self._play_job = None
+        self._status_var.set("Playback paused.")
+
+    def _queue_next_frame(self) -> None:
+        if not self._playing:
+            return
+        self._play_job = self.after(self._play_interval_ms, self._step_playback)
+
+    def _step_playback(self) -> None:
+        if not self._playing:
+            return
+        self._next_pose()
+        self._queue_next_frame()
 
     def _on_tree_select(self, _event: object) -> None:
         selection = self._tree.selection()

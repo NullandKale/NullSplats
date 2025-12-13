@@ -22,8 +22,8 @@ void main() {
         discard;
     }
     
-    // Apply sigmoid to opacity
-    float alpha = 1.0 / (1.0 + exp(-(splat_opacity + opacity_bias)));
+    // Opacity is already in [0,1] from the PLY; apply bias in linear domain.
+    float alpha = clamp(splat_opacity + opacity_bias, 0.0, 1.0);
     
     // Check if contribution is negligible
     float minPower = log(1.0 / 255.0 / alpha);

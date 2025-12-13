@@ -200,11 +200,18 @@ class GLCanvas(ttk.Frame):
         self.canvas: Optional[tk.Widget] = None
         self._last_path: Optional[Path] = None
         self._latest_load_request = 0
+        self._active_request_id = 0
         self._load_lock = threading.Lock()
+        self._load_in_progress = False
+        self._pending_load: Optional[Path] = None
         self._load_thread: Optional[threading.Thread] = None
         self._current_view: Optional[CameraView] = None
+        self._resize_job: Optional[str] = None
+        self._rendering: bool = False
         self._init_viewer(width, height)
         self._camera_update_callbacks: list[Callable[[CameraView], None]] = []
+        # Ensure the frame itself expands with the paned container.
+        self.pack_propagate(False)
 
     def _init_viewer(self, width: int, height: int) -> None:
         if GaussianSplatViewer is None:
@@ -220,6 +227,8 @@ class GLCanvas(ttk.Frame):
         try:
             self._viewer = GaussianSplatViewer(self, width=width, height=height)
             self._viewer.pack(fill="both", expand=True)
+            # Throttle render restarts during Tk resize events to avoid GL context churn.
+            self._viewer.bind("<Configure>", self._on_resize)
             self.canvas = self._viewer
         except Exception:  # noqa: BLE001
             logger.exception("Failed to initialize GaussianSplatViewer")
@@ -234,25 +243,121 @@ class GLCanvas(ttk.Frame):
             self._viewer = None
 
     def start_rendering(self) -> None:
+        # The viewer might have been recreated while _rendering stayed True; ensure it is actually running.
+        if self._rendering:
+            animate_flag = getattr(self._viewer, "animate", None)
+            if animate_flag in (0, None):
+                logger.info("GLCanvas start_rendering: restarting viewer despite _rendering=True (animate=%s)", animate_flag)
+            else:
+                return
         if self._viewer is not None and hasattr(self._viewer, "start_rendering"):
+            logger.info(
+                "GLCanvas start_rendering viewer=%s mapped=%s animate=%s rendering=%s",
+                type(self._viewer).__name__,
+                self.winfo_ismapped(),
+                getattr(self._viewer, "animate", None),
+                self._rendering,
+            )
             try:
                 self._viewer.start_rendering()
+                self._rendering = True
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start OpenGL viewer")
+        else:
+            logger.info("GLCanvas start_rendering falling back to render_once (no viewer)")
+            self.render_once()
 
     def stop_rendering(self) -> None:
         if self._viewer is not None and hasattr(self._viewer, "stop_rendering"):
+            logger.info(
+                "GLCanvas stop_rendering viewer=%s animate=%s rendering=%s",
+                type(self._viewer).__name__,
+                getattr(self._viewer, "animate", None),
+                self._rendering,
+            )
             try:
                 self._viewer.stop_rendering()
+                self._rendering = False
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to stop OpenGL viewer")
 
     def clear(self) -> None:
+        """Stop and reset viewer state for a scene change."""
+        try:
+            self.stop_rendering()
+        except Exception:  # noqa: BLE001
+            logger.debug("Clear stop_rendering failed", exc_info=True)
+        with self._load_lock:
+            self._latest_load_request += 1  # stale any in-flight loads
+            self._last_path = None
+            self._rendering = False
+            self._pending_load = None
+        self._current_view = None
+        try:
+            self.renderer.data = None
+        except Exception:
+            pass
         if self._viewer is not None and hasattr(self._viewer, "clear"):
             try:
                 self._viewer.clear()
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to clear OpenGL viewer")
+
+    def render_once(self) -> None:
+        """Trigger a single render pass if available."""
+        if self._viewer is not None and hasattr(self._viewer, "render_once"):
+            try:
+                self._viewer.render_once()
+            except Exception:  # noqa: BLE001
+                logger.debug("Render-once failed", exc_info=True)
+
+    def _on_resize(self, event: tk.Event) -> None:
+        """Pause rendering during resize to prevent context errors, then restart."""
+        if self._viewer is None:
+            return
+        try:
+            # Keep the viewer's idea of width/height in sync with the Tk widget.
+            w = max(1, int(getattr(event, "width", self.winfo_width())))
+            h = max(1, int(getattr(event, "height", self.winfo_height())))
+            self._viewer.width = w
+            self._viewer.height = h
+            try:
+                self._viewer.configure(width=w, height=h)
+            except Exception:
+                pass
+        except Exception:  # noqa: BLE001
+            logger.debug("Failed to sync viewer size on resize", exc_info=True)
+        try:
+            self._viewer.stop_rendering()
+        except Exception:  # noqa: BLE001
+            logger.debug("Resize stop_rendering failed", exc_info=True)
+        if self._resize_job is not None:
+            try:
+                self.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        # Restart after resize settles.
+        self._resize_job = self.after(200, self._resume_after_resize)
+
+    def _resume_after_resize(self) -> None:
+        self._resize_job = None
+        if self._viewer is None:
+            return
+        try:
+            w = max(1, int(self.winfo_width()))
+            h = max(1, int(self.winfo_height()))
+            self._viewer.width = w
+            self._viewer.height = h
+            try:
+                self._viewer.configure(width=w, height=h)
+            except Exception:
+                pass
+        except Exception:  # noqa: BLE001
+            logger.debug("Failed to sync viewer size after resize", exc_info=True)
+        try:
+            self._viewer.start_rendering()
+        except Exception:  # noqa: BLE001
+            logger.debug("Resize start_rendering failed", exc_info=True)
 
     def set_camera_pose(self, *args, **kwargs) -> None:
         """Forward camera pose changes to the underlying viewer if available."""
@@ -359,10 +464,59 @@ class GLCanvas(ttk.Frame):
             except Exception:  # noqa: BLE001
                 logger.exception("Camera listener callback failed")
 
+    def _capture_viewer_camera(self) -> Optional[CameraView]:
+        """Read the current viewer camera into a CameraView if available."""
+        viewer = self._viewer
+        if viewer is None:
+            return None
+        try:
+            cam = getattr(viewer, "camera", None)
+            if cam is None:
+                return None
+            pos = np.array(cam.position, dtype=np.float32)
+            target = np.array(cam.target, dtype=np.float32)
+            direction = target - pos
+            distance = float(np.linalg.norm(direction))
+            if distance < 1e-6:
+                return None
+            yaw, pitch = _vector_to_angles(torch.tensor(direction))
+            device = self.renderer.data.center.device if self.renderer.data is not None else torch.device("cpu")
+            return CameraView(
+                yaw=float(yaw),
+                pitch=float(pitch),
+                distance=distance,
+                target=torch.tensor(target, device=device, dtype=torch.float32),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Failed to capture viewer camera", exc_info=True)
+            return None
+
     def load_splat(self, path: Path) -> None:
         target = Path(path)
-        self._latest_load_request += 1
-        request_id = self._latest_load_request
+        with self._load_lock:
+            self._latest_load_request += 1
+            request_id = self._latest_load_request
+            if self._load_in_progress:
+                self._pending_load = target
+                logger.info(
+                    "GLCanvas load_splat queued request=%d path=%s active_request=%s pending=%s",
+                    request_id,
+                    target,
+                    self._active_request_id,
+                    self._pending_load,
+                )
+                return
+            self._load_in_progress = True
+            self._active_request_id = request_id
+        logger.info(
+            "GLCanvas load_splat request=%d path=%s viewer=%s mapped=%s rendering=%s last_path=%s",
+            request_id,
+            target,
+            type(self._viewer).__name__ if self._viewer is not None else None,
+            self.winfo_ismapped(),
+            self._rendering,
+            self._last_path,
+        )
         thread = threading.Thread(
             target=self._load_worker,
             args=(request_id, target),
@@ -378,21 +532,75 @@ class GLCanvas(ttk.Frame):
         return self._last_path
 
     def _load_worker(self, request_id: int, path: Path) -> None:
+        data: Optional[SplatData] = None
         try:
             data = self.renderer.load(path)
         except Exception:  # noqa: BLE001
-            logger.exception("GLCanvas failed to load splat %s", path)
+            logger.exception("GLCanvas failed to load splat %s (request=%d)", path, request_id)
+            self._finish_load(request_id)
             return
         with self._load_lock:
-            if request_id != self._latest_load_request:
-                logger.info("GLCanvas load request stale request_id=%d latest=%d", request_id, self._latest_load_request)
-                return
-            self._last_path = path
-        self.after(0, lambda: self._apply_data(data, path))
+            previous_path = self._last_path
+            is_stale = request_id != self._latest_load_request
+            if not is_stale:
+                self._last_path = path
+            latest_request = self._latest_load_request
+        def _apply_and_finish() -> None:
+            try:
+                if is_stale:
+                    logger.info(
+                        "GLCanvas load request stale request_id=%d latest=%d pending=%s",
+                        request_id,
+                        latest_request,
+                        self._pending_load,
+                    )
+                    return
+                self._apply_data(data, path, previous_path)
+            finally:
+                self._finish_load(request_id)
+        self.after(0, _apply_and_finish)
 
-    def _apply_data(self, data: SplatData, path: Path) -> None:
+    def _finish_load(self, request_id: int) -> None:
+        next_path: Optional[Path] = None
+        with self._load_lock:
+            self._load_thread = None
+            self._active_request_id = 0
+            self._load_in_progress = False
+            if self._pending_load is not None:
+                next_path = self._pending_load
+                self._pending_load = None
+        if next_path is not None:
+            logger.info("GLCanvas dispatching queued load path=%s after request=%d", next_path, request_id)
+            self.load_splat(next_path)
+
+    def _apply_data(self, data: SplatData, path: Path, previous_path: Optional[Path]) -> None:
         if self._viewer is None:
+            logger.info("GLCanvas apply_data skipped (no viewer) path=%s request_path=%s last_path=%s", path, path, self._last_path)
             return
+        if not self.winfo_exists():
+            logger.info("GLCanvas apply_data skipped (widget destroyed) path=%s", path)
+            return
+        logger.debug(
+            "GLCanvas apply_data enter path=%s viewer=%s mapped=%s animate=%s rendering=%s",
+            path,
+            type(self._viewer).__name__,
+            self.winfo_ismapped(),
+            getattr(self._viewer, "animate", None),
+            self._rendering,
+        )
+        # Reset camera when switching to a new checkpoint/scene so we don't stare at empty space.
+        try:
+            if previous_path is None or previous_path.parent != path.parent:
+                logger.debug(
+                    "GLCanvas resetting camera for new scene load path=%s previous_path=%s current_view=%s",
+                    path,
+                    previous_path,
+                    self._current_view,
+                )
+                self._current_view = None
+        except Exception:
+            self._current_view = None
+        view: Optional[CameraView] = self._current_view
         try:
             means = data.means.detach().cpu().numpy()
             scales = data.scales_log.detach().cpu().numpy()
@@ -401,11 +609,48 @@ class GLCanvas(ttk.Frame):
             colors = data.colors.detach().cpu().numpy()
             sh_dc = colors[:, 0, :]
             self._viewer.set_gaussians(means, scales, quats, opacities, sh_dc)
-            view = self._default_view_from_data(data, path)
-            self._current_view = view
-            self._update_viewer_camera(view)
-            self._notify_camera_listeners(view)
+            # Preserve user camera if they orbited since the last load.
+            captured_view = self._capture_viewer_camera()
+            if captured_view is not None:
+                self._current_view = captured_view
+            if self._current_view is None:
+                view = self._default_view_from_data(data, path)
+                self._current_view = view
+                self._update_viewer_camera(view)
+            else:
+                # Keep current yaw/pitch/distance but retarget to the new data center.
+                try:
+                    self._current_view = CameraView(
+                        yaw=self._current_view.yaw,
+                        pitch=self._current_view.pitch,
+                        distance=self._current_view.distance,
+                        target=data.center,
+                    )
+                    self._update_viewer_camera(self._current_view)
+                except Exception:
+                    self._current_view = self._default_view_from_data(data, path)
+                    self._update_viewer_camera(self._current_view)
+            logger.info(
+                "GLCanvas apply_data success path=%s gaussians=%d current_view=%s viewer_running=%s",
+                path,
+                means.shape[0],
+                self._current_view,
+                self._rendering,
+            )
+            if view is not None:
+                self._notify_camera_listeners(view)
             self.start_rendering()
+            # Force an immediate render and depth sort so the user sees the latest checkpoint.
+            if hasattr(self._viewer, "request_depth_sort"):
+                try:
+                    self._viewer.request_depth_sort()
+                except Exception:  # noqa: BLE001
+                    logger.debug("Depth sort request failed", exc_info=True)
+            if hasattr(self._viewer, "render_once"):
+                try:
+                    self._viewer.render_once()
+                except Exception:  # noqa: BLE001
+                    logger.debug("Render-once failed", exc_info=True)
             logger.info("GLCanvas applied data %s gaussians=%d", path, means.shape[0])
         except Exception:  # noqa: BLE001
             logger.exception("GLCanvas failed to upload splat %s", path)

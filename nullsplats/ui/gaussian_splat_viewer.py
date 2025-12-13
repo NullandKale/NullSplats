@@ -373,13 +373,18 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
         self.scene_center = (self.scene_bounds_min + self.scene_bounds_max) / 2.0
         
         scene_size = self.scene_bounds_max - self.scene_bounds_min
-        self.scene_size = np.max(scene_size)
+        self.scene_size = float(np.max(scene_size))
+        if not np.isfinite(self.scene_size) or self.scene_size < 1e-3:
+            # Avoid degenerate bounds that collapse the camera/projection.
+            self.scene_size = 1.0
+            self.scene_bounds_min = self.scene_center - 0.5
+            self.scene_bounds_max = self.scene_center + 0.5
         
         # CAMERA OUTSIDE SCENE - looking IN at center
         # Place camera at MIN Z bound (in front), looking at center
         cam_x = self.scene_center[0]
         cam_y = self.scene_center[1]
-        cam_z = self.scene_bounds_min[2] - self.scene_size * 0.5  # In front of scene
+        cam_z = self.scene_bounds_min[2] - max(self.scene_size * 0.5, 0.5)  # In front of scene with minimum offset
         
         self.camera.set_position_direct(cam_x, cam_y, cam_z)
         self.camera.set_target_direct(self.scene_center[0], self.scene_center[1], self.scene_center[2])
@@ -621,8 +626,8 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             if self.width <= 0 or self.height <= 0:
                 return
             widget_aspect = self.width / self.height
-            near_plane = self.scene_size * 0.01
-            far_plane = self.scene_size * 10.0
+            near_plane = max(self.scene_size * 0.01, 0.01)
+            far_plane = max(self.scene_size * 10.0, near_plane * 10.0)
             projection = self._perspective(45.0, widget_aspect, near_plane, far_plane)
             view = self.camera.get_view_matrix()
 
@@ -664,6 +669,11 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
                     logger.warning("View rotation not orthonormal: diag=%s", np.diag(orthonormal))
 
             # Clear buffers
+            # Keep viewport in sync with the Tk widget dimensions so the render fills the space.
+            int_width = max(1, int(self.width))
+            int_height = max(1, int(self.height))
+            glViewport(0, 0, int_width, int_height)
+
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
             # Skip rendering if no data
@@ -720,7 +730,7 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
                 glUniform1f(opacity_bias_loc, self.opacity_bias)
             
             # Pass viewport size
-            viewport_size = np.array([float(self.width), float(self.height)], dtype=np.float32)
+            viewport_size = np.array([float(int_width), float(int_height)], dtype=np.float32)
             glUniform2fv(viewport_size_loc, 1, viewport_size)
             
             # Ensure correct OpenGL state before drawing
@@ -813,7 +823,6 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             self._last_x = event.x
             self._last_y = event.y
             self._needs_depth_sort = True
-            logger.info("Orbit change -> camera pos=%s target=%s", tuple(self.camera.position.tolist()), tuple(self.camera.target.tolist()))
     
     def _on_right_mouse_drag(self, event):
         """Handle right mouse drag for panning."""
@@ -922,17 +931,66 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
         }
         self.background_color = color_map.get(color, (0.0, 0.0, 0.0, 1.0))
     
-    def stop_rendering(self):
+    def _stop_rendering_safe(self):
         """Stop the render loop to reduce GPU usage."""
-        if OPENGL_AVAILABLE:
-            self.animate = 0
-            logger.info("Gaussian splat viewer rendering stopped")
-    
-    def start_rendering(self):
+        if not OPENGL_AVAILABLE:
+            return
+        # Stop scheduling future redraws and cancel any pending callback to avoid
+        # running GL code after the widget is unmapped (can crash on Windows).
+        self.animate = 0
+        try:
+            if getattr(self, "cb", None):
+                self.after_cancel(self.cb)
+                self.cb = None
+        except Exception as exc:
+            logger.debug("Failed to cancel render callback: %s", exc)
+        logger.info("Gaussian splat viewer rendering stopped")
+
+    def stop_rendering(self):
+        self._stop_rendering_safe()
+
+    def _start_rendering_safe(self):
         """Start the render loop."""
-        if OPENGL_AVAILABLE:
-            self.animate = 1
-            logger.info("Gaussian splat viewer rendering started")
+        if not OPENGL_AVAILABLE:
+            return
+        self.animate = 1
+        logger.info("Gaussian splat viewer rendering started")
+        # If the widget is visible, kick off the display loop immediately.
+        # Otherwise, retry shortly until Tk has mapped the widget.
+        def _kickoff() -> None:
+            if self.animate == 0:
+                return
+            if not self.winfo_ismapped():
+                self.after(50, _kickoff)
+                return
+            if not getattr(self, "context_created", False):
+                try:
+                    self.tkCreateContext()
+                    self.initgl()
+                    self.context_created = True
+                except Exception as exc:
+                    logger.exception("Failed to create GL context during start_rendering")
+                    self.animate = 0
+                    return
+            try:
+                self._display()
+            except Exception as exc:
+                logger.exception("Display loop failed to start")
+                self.animate = 0
+
+        if not getattr(self, "cb", None):
+            _kickoff()
+
+    def start_rendering(self):
+        self._start_rendering_safe()
+
+    def _display(self):  # type: ignore[override]
+        """Wrap base display loop to trap GL errors instead of crashing."""
+        try:
+            super()._display()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Display loop crashed")
+            self.animate = 0
     
     def set_camera_pose(self, position: np.ndarray, rotation: Optional[np.ndarray] = None, target: Optional[np.ndarray] = None):
         """Set camera to specific position with optional rotation or target.
@@ -1333,15 +1391,11 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
     
     def stop_rendering(self):
         """Stop the render loop."""
-        if OPENGL_AVAILABLE:
-            self.animate = 0
-            logger.info("Gaussian splat viewer rendering stopped")
-    
+        self._stop_rendering_safe()
+
     def start_rendering(self):
         """Start the render loop."""
-        if OPENGL_AVAILABLE:
-            self.animate = 1
-            logger.info("Gaussian splat viewer rendering started")
+        self._start_rendering_safe()
     
     def destroy(self):
         """Override destroy to ensure proper cleanup."""
@@ -1359,25 +1413,17 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
         """Clear the viewer and release resources."""
         if OPENGL_AVAILABLE:
             try:
-                self.animate = 0  # Stop rendering
-                
-                # Delete shader program first
-                if self.shader_program and glIsProgram(self.shader_program):
-                    glDeleteProgram(self.shader_program)
-                    logger.info("Deleted Gaussian splat shader program")
-                
-                if self.quad_vao:
-                    glDeleteVertexArrays(1, [self.quad_vao])
-                if self.quad_vbo:
-                    glDeleteBuffers(1, [self.quad_vbo])
-                if self.instance_vbo:
-                    glDeleteBuffers(1, [self.instance_vbo])
+                # Stop rendering and drop any pending uploads; keep GL resources intact
+                self.animate = 0
+                try:
+                    if getattr(self, "cb", None):
+                        self.after_cancel(self.cb)
+                        self.cb = None
+                except Exception:
+                    pass
+                self._pending_gaussians = None
+                self._needs_data_upload = False
+                self._needs_depth_sort = False
+                self.num_gaussians = 0
             except Exception as e:
                 logger.warning(f"Error during Gaussian splat cleanup: {e}")
-            
-            # Clear all references
-            self.shader_program = None
-            self.quad_vao = None
-            self.quad_vbo = None
-            self.instance_vbo = None
-            self.num_gaussians = 0

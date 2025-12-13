@@ -31,6 +31,7 @@ from gsplat.strategy import DefaultStrategy
 
 
 logger = get_logger("splat_train")
+LOG_PROGRESS_INTERVAL = 100
 ProgressCallback = Callable[[int, int, float], None]
 CheckpointCallback = Callable[[int, Path], None]
 gsplat = None  # set after toolkit configuration
@@ -415,31 +416,32 @@ def train_scene(
         if progress_callback is not None:
             progress_callback(iteration, config.iterations, float(loss.item()))
 
-        _append_log(
-            log_path,
-            {
-                "event": "iteration",
-                "iteration": iteration,
-                "loss_l1": float(loss.item()),
-                "psnr": psnr,
-                "mean_scale": float(scales.mean().item()),
-                "min_scale": float(scales.min().item()),
-                "max_scale": float(scales.max().item()),
-                "mean_opacity": float(opacities.mean().item()),
-                "mean_quat_norm": float(torch.linalg.norm(splats_param["quats"], dim=1).mean().item()),
-                "ssim": ssim_loss,
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-            },
-        )
-        logger.info(
-            "Iteration %d/%d loss=%.4f psnr=%.2f mean_scale=%.6f mean_opacity=%.4f",
-            iteration,
-            config.iterations,
-            float(loss.item()),
-            psnr,
-            float(scales.mean().item()),
-            float(opacities.mean().item()),
-        )
+        if iteration == 1 or iteration == config.iterations or iteration % LOG_PROGRESS_INTERVAL == 0:
+            _append_log(
+                log_path,
+                {
+                    "event": "iteration",
+                    "iteration": iteration,
+                    "loss_l1": float(loss.item()),
+                    "psnr": psnr,
+                    "mean_scale": float(scales.mean().item()),
+                    "min_scale": float(scales.min().item()),
+                    "max_scale": float(scales.max().item()),
+                    "mean_opacity": float(opacities.mean().item()),
+                    "mean_quat_norm": float(torch.linalg.norm(splats_param["quats"], dim=1).mean().item()),
+                    "ssim": ssim_loss,
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                },
+            )
+            logger.info(
+                "Iteration %d/%d loss=%.4f psnr=%.2f mean_scale=%.6f mean_opacity=%.4f",
+                iteration,
+                config.iterations,
+                float(loss.item()),
+                psnr,
+                float(scales.mean().item()),
+                float(opacities.mean().item()),
+            )
 
         if iteration % config.snapshot_interval == 0 or iteration == config.iterations:
             last_checkpoint = _checkpoint_path(iteration)
