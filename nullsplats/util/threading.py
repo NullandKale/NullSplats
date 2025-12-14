@@ -58,11 +58,11 @@ def run_in_background(
             result = func(*args, **kwargs)
             _logger.info("Background task completed: %s", label)
             if on_success is not None:
-                _dispatch_to_ui(lambda: on_success(result))
+                _dispatch_to_ui(lambda res=result: on_success(res))
         except Exception as exc:  # noqa: BLE001 - forward errors to handler
             _logger.exception("Background task failed: %s", label)
             if on_error is not None:
-                _dispatch_to_ui(lambda: on_error(exc))
+                _dispatch_to_ui(lambda err=exc: on_error(err))
             else:
                 raise
 

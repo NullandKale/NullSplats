@@ -15,6 +15,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+import sys
 from typing import Iterable, List
 
 from nullsplats.backend.io_cache import ScenePaths, ensure_scene_dirs
@@ -29,7 +30,7 @@ logger = get_logger("sfm_pipeline")
 class SfmConfig:
     """Configuration for COLMAP execution."""
 
-    colmap_path: str = r"C:\Users\alec\source\python\NullSplats\tools\colmap\COLMAP.bat"
+    colmap_path: str = ""
     matcher: str = "exhaustive"
     camera_model: str = "PINHOLE"
 
@@ -69,7 +70,8 @@ def run_sfm(
     normalized_scene = SceneId(str(scene_id))
     paths = ensure_scene_dirs(normalized_scene, cache_root=cache_root)
     _require_frames(paths.frames_selected_dir)
-    _assert_executable(config.colmap_path, "COLMAP")
+    colmap_exe = config.colmap_path or _default_colmap_path()
+    _assert_executable(colmap_exe, "COLMAP")
 
     sfm_dir = paths.sfm_dir
     log_dir = sfm_dir / "logs"
@@ -87,18 +89,18 @@ def run_sfm(
         "SfM start scene=%s images=%s colmap=%s matcher=%s camera_model=%s",
         normalized_scene,
         images_path,
-        config.colmap_path,
+        colmap_exe,
         config.matcher,
         config.camera_model,
     )
     start_time = time.perf_counter()
     with ExitStack() as stack:
-        _ensure_dll_search_paths(config, stack)
+        _ensure_dll_search_paths(colmap_exe, stack)
         with log_path.open("a", encoding="utf-8") as log_file:
-            _log_binary_details(config, log_file)
+            _log_binary_details(colmap_exe, log_file)
             _stream_command(
                 [
-                    config.colmap_path,
+                    colmap_exe,
                     "feature_extractor",
                     "--database_path",
                     str(database_path),
@@ -119,7 +121,7 @@ def run_sfm(
             )
             _stream_command(
                 [
-                    config.colmap_path,
+                    colmap_exe,
                     f"{config.matcher}_matcher",
                     "--database_path",
                     str(database_path),
@@ -130,7 +132,7 @@ def run_sfm(
             )
             _stream_command(
                 [
-                    config.colmap_path,
+                    colmap_exe,
                     "mapper",
                     "--database_path",
                     str(database_path),
@@ -149,7 +151,7 @@ def run_sfm(
             )
             _stream_command(
                 [
-                    config.colmap_path,
+                    colmap_exe,
                     "model_converter",
                     "--input_path",
                     str(sparse_model),
@@ -166,7 +168,7 @@ def run_sfm(
             text_model_dir.mkdir(parents=True, exist_ok=True)
             _stream_command(
                 [
-                    config.colmap_path,
+                    colmap_exe,
                     "model_converter",
                     "--input_path",
                     str(sparse_model),
@@ -231,7 +233,7 @@ def _assert_executable(path: str, label: str) -> None:
         raise FileNotFoundError(f"{label} executable not found: {path}")
 
 
-def _ensure_dll_search_paths(config: SfmConfig, stack: ExitStack) -> None:
+def _ensure_dll_search_paths(colmap_path: str, stack: ExitStack) -> None:
     """Add DLL search paths for COLMAP directories on Windows."""
     try:
         import os
@@ -241,7 +243,7 @@ def _ensure_dll_search_paths(config: SfmConfig, stack: ExitStack) -> None:
     if add_dll is None:
         return
     seen: set[Path] = set()
-    for binary in (config.colmap_path,):
+    for binary in (colmap_path,):
         candidate = Path(binary)
         parents = []
         if candidate.suffix:
@@ -258,9 +260,9 @@ def _ensure_dll_search_paths(config: SfmConfig, stack: ExitStack) -> None:
                 logger.info("Added DLL search path: %s", parent)
 
 
-def _log_binary_details(config: SfmConfig, log_file) -> None:
+def _log_binary_details(colmap_path: str, log_file) -> None:
     """Write basic binary diagnostics for troubleshooting."""
-    for label, path_str in (("COLMAP", config.colmap_path),):
+    for label, path_str in (("COLMAP", colmap_path or _default_colmap_path()),):
         path = Path(path_str)
         exists = path.exists()
         size = path.stat().st_size if exists else 0
@@ -299,6 +301,22 @@ def _describe_failure(code: int) -> str:
     if code in {3221225477, -1073741819}:  # STATUS_ACCESS_VIOLATION
         return " (access violation; check GPU/driver and binary compatibility)"
     return f" (exit 0x{code:08X})"
+
+
+def _default_app_dir() -> Path:
+    """Resolve the root folder where tools are expected (dist or repo)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+def _default_colmap_path() -> str:
+    """Prefer a bundled COLMAP; fall back to the repo-local tools copy."""
+    bundled = _default_app_dir() / "tools" / "colmap" / "COLMAP.bat"
+    if bundled.exists():
+        return str(bundled)
+    repo_default = Path(r"C:\Users\alec\source\python\NullSplats\tools\colmap\COLMAP.bat")
+    return str(repo_default)
 
 
 __all__ = ["SfmConfig", "SfmResult", "run_sfm"]

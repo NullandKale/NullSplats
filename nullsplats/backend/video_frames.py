@@ -8,7 +8,7 @@ consulted; callers must pass explicit parameters.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 import json
@@ -34,6 +34,9 @@ class FrameScore:
 
     filename: str
     score: float
+    sharpness: Optional[float] = None
+    variance: Optional[float] = None
+    fingerprint: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -120,7 +123,16 @@ def extract_frames(
         "target_count": target_count,
         "available_frames": [item.filename for item in frame_scores],
         "selected_frames": selected_frames,
-        "frame_scores": [{"file": item.filename, "score": item.score} for item in frame_scores],
+        "frame_scores": [
+            {
+                "file": item.filename,
+                "score": item.score,
+                "sharpness": item.sharpness,
+                "variance": item.variance,
+                "fingerprint": item.fingerprint,
+            }
+            for item in frame_scores
+        ],
         "created_at": datetime.utcnow().isoformat() + "Z",
     }
     save_metadata(normalized_scene, metadata, cache_root=cache_root)
@@ -153,8 +165,17 @@ def load_cached_frames(scene_id: str | SceneId, cache_root: str | Path = "cache"
     available_frames = metadata.get("available_frames", [])
     scores = metadata.get("frame_scores", [])
     frame_scores = [
-        FrameScore(filename=item["file"], score=float(item["score"])) for item in scores if "file" in item
+        FrameScore(
+            filename=item["file"],
+            score=float(item.get("score", 0.0)),
+            sharpness=float(item["sharpness"]) if "sharpness" in item and item["sharpness"] is not None else None,
+            variance=float(item["variance"]) if "variance" in item and item["variance"] is not None else None,
+            fingerprint=str(item["fingerprint"]) if "fingerprint" in item and item["fingerprint"] is not None else None,
+        )
+        for item in scores
+        if "file" in item
     ]
+    frame_scores = _score_with_quality(frame_scores)
     selected_frames = metadata.get("selected_frames", [])
     candidate_count = int(metadata.get("candidate_count", len(available_frames)))
     target_count = int(metadata.get("target_count", len(selected_frames)))
@@ -229,10 +250,35 @@ def persist_selection(
 
 
 def auto_select_best(frame_scores: Sequence[FrameScore], target_count: int) -> List[str]:
-    """Return the filenames of the best frames by sharpness score."""
-    sorted_scores = sorted(frame_scores, key=lambda item: item.score, reverse=True)
-    limited = sorted_scores[: target_count if target_count > 0 else 0]
-    return [item.filename for item in limited]
+    """Return filenames of the best frames using focus, variance, and diversity."""
+    if target_count <= 0 or not frame_scores:
+        return []
+    weighted = _score_with_quality(frame_scores)
+    sorted_scores = sorted(weighted, key=lambda item: item.score, reverse=True)
+    selected: List[str] = []
+    selected_fingerprints: List[str] = []
+    diversity_threshold = 8  # minimum Hamming distance to consider a frame unique enough
+
+    for item in sorted_scores:
+        if item.fingerprint and selected_fingerprints:
+            distances = [_fingerprint_distance(item.fingerprint, fp) for fp in selected_fingerprints]
+            if distances and min(distances) < diversity_threshold:
+                continue
+        selected.append(item.filename)
+        if item.fingerprint:
+            selected_fingerprints.append(item.fingerprint)
+        if len(selected) >= target_count:
+            break
+
+    if len(selected) < target_count:
+        for item in sorted_scores:
+            if item.filename in selected:
+                continue
+            selected.append(item.filename)
+            if len(selected) >= target_count:
+                break
+
+    return selected
 
 
 def _evenly_spaced_indices(total: int, count: int) -> List[int]:
@@ -317,14 +363,23 @@ def _extract_from_video(
             filename = f"frame_{len(scores):04d}.png"
             destination = output_dir / filename
             _save_frame_image(frame, destination)
-            score = _sharpness_score(frame)
-            scores.append(FrameScore(filename=filename, score=score))
+            sharpness, variance, fingerprint = _frame_quality_metrics(frame)
+            scores.append(
+                FrameScore(
+                    filename=filename,
+                    score=sharpness,
+                    sharpness=sharpness,
+                    variance=variance,
+                    fingerprint=fingerprint,
+                )
+            )
             if progress_callback:
                 progress_callback(len(scores), sample_count)
             next_target_idx += 1
             next_target = target_indices[next_target_idx] if next_target_idx < len(target_indices) else None
     finally:
         reader.close()
+    scores = _score_with_quality(scores)
     if scores:
         mean_score = float(np.mean([item.score for item in scores]))
         min_score = min(item.score for item in scores)
@@ -369,10 +424,19 @@ def _extract_from_image_folder(
         filename = f"frame_{idx:04d}.png"
         destination = output_dir / filename
         _save_frame_image(frame, destination)
-        score = _sharpness_score(frame)
-        scores.append(FrameScore(filename=filename, score=score))
+        sharpness, variance, fingerprint = _frame_quality_metrics(frame)
+        scores.append(
+            FrameScore(
+                filename=filename,
+                score=sharpness,
+                sharpness=sharpness,
+                variance=variance,
+                fingerprint=fingerprint,
+            )
+        )
         if progress_callback:
             progress_callback(idx + 1, use_count)
+    scores = _score_with_quality(scores)
     if scores:
         mean_score = float(np.mean([item.score for item in scores]))
         min_score = min(item.score for item in scores)
@@ -409,8 +473,16 @@ def _clear_directory(path: Path) -> None:
             item.unlink()
 
 
-def _sharpness_score(frame: np.ndarray) -> float:
+def _frame_quality_metrics(frame: np.ndarray) -> tuple[float, float, str]:
+    """Return sharpness, variance, and a small perceptual fingerprint for a frame."""
     grayscale = _to_grayscale(frame)
+    sharpness = _sharpness_from_grayscale(grayscale)
+    variance = _variance_score(grayscale)
+    fingerprint = _fingerprint_from_grayscale(grayscale)
+    return sharpness, variance, fingerprint
+
+
+def _sharpness_from_grayscale(grayscale: np.ndarray) -> float:
     laplacian = (
         -4 * grayscale
         + np.roll(grayscale, 1, axis=0)
@@ -418,8 +490,57 @@ def _sharpness_score(frame: np.ndarray) -> float:
         + np.roll(grayscale, 1, axis=1)
         + np.roll(grayscale, -1, axis=1)
     )
-    score = float(np.mean(np.abs(laplacian)))
-    return score
+    return float(np.mean(np.abs(laplacian)))
+
+
+def _variance_score(grayscale: np.ndarray) -> float:
+    return float(np.var(grayscale))
+
+
+def _fingerprint_from_grayscale(grayscale: np.ndarray, hash_size: int = 8) -> str:
+    """Compact perceptual hash used to penalize visually similar frames."""
+    image = Image.fromarray(np.clip(grayscale, 0, 255).astype(np.uint8))
+    small = image.resize((hash_size, hash_size), Image.LANCZOS)
+    arr = np.array(small, dtype=np.float32)
+    mean_val = float(arr.mean()) if arr.size else 0.0
+    bits = (arr.flatten() > mean_val).astype(np.uint8)
+    value = 0
+    for bit in bits:
+        value = (value << 1) | int(bit)
+    # 64 bits -> 16 hex characters for the default hash_size.
+    width = max(1, hash_size * hash_size // 4)
+    return f"{value:0{width}x}"
+
+
+def _score_with_quality(frame_scores: Sequence[FrameScore]) -> List[FrameScore]:
+    """Combine sharpness and variance into a single quality score."""
+    if not frame_scores:
+        return []
+    sharp_values = [fs.sharpness for fs in frame_scores if fs.sharpness is not None]
+    var_values = [fs.variance for fs in frame_scores if fs.variance is not None]
+    if not sharp_values or not var_values:
+        return list(frame_scores)
+    sharp_min, sharp_max = min(sharp_values), max(sharp_values)
+    var_min, var_max = min(var_values), max(var_values)
+    sharp_range = sharp_max - sharp_min if sharp_max != sharp_min else 1e-6
+    var_range = var_max - var_min if var_max != var_min else 1e-6
+    weighted: List[FrameScore] = []
+    for item in frame_scores:
+        sharp_norm = (item.sharpness - sharp_min) / sharp_range if item.sharpness is not None else 0.0
+        var_norm = (item.variance - var_min) / var_range if item.variance is not None else 0.0
+        combined = 0.7 * sharp_norm + 0.3 * var_norm
+        weighted.append(replace(item, score=combined))
+    return weighted
+
+
+def _fingerprint_distance(a: str, b: str) -> int:
+    """Hamming distance between two perceptual hashes encoded as hex strings."""
+    try:
+        a_int = int(a, 16)
+        b_int = int(b, 16)
+    except Exception:
+        return 64
+    return int(bin(a_int ^ b_int).count("1"))
 
 
 def _to_grayscale(frame: np.ndarray) -> np.ndarray:

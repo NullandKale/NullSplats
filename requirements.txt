@@ -4,11 +4,9 @@ numpy
 Pillow
 packaging
 ninja
-tyro
 PyYAML
 imageio
 tqdm
 torchmetrics
-opencv-python
 PyOpenGL
 pyopengltk

@@ -27,21 +27,36 @@ from nullsplats.ui.render_controls import RenderSettingsPanel
 from nullsplats.ui.colmap_camera_panel import ColmapCameraPanel
 
 
+def _app_root() -> Path:
+    """Resolve application root (frozen dist or repo)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
 def _default_binary_path(tool: str) -> str:
-    """Return a repo-local binary path if present, otherwise the bare tool name."""
-    repo_root = Path(__file__).resolve().parents[2]
+    """Return a bundled binary path if present, otherwise the bare tool name."""
+    root = _app_root()
     if tool == "colmap":
-        return str(repo_root / "tools" / "colmap" / "COLMAP.bat")
+        candidate = root / "tools" / "colmap" / "COLMAP.bat"
+        if candidate.exists():
+            return str(candidate)
+        repo_default = Path(r"C:\Users\alec\source\python\NullSplats\tools\colmap\COLMAP.bat")
+        if repo_default.exists():
+            return str(repo_default)
     return tool
 
 
 def _default_cuda_path() -> str:
     """Return preferred CUDA toolkit path if present."""
-    preferred = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8")
-    if preferred.exists():
-        return str(preferred)
+    bundled = _app_root() / "cuda"
+    if bundled.exists():
+        return str(bundled)
     env_home = Path(os.environ.get("CUDA_HOME", "")) if "CUDA_HOME" in os.environ else None
-    return str(env_home) if env_home and env_home.exists() else ""
+    if env_home and env_home.exists():
+        return str(env_home)
+    preferred = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8")
+    return str(preferred) if preferred.exists() else ""
 
 
 class TrainingTab:

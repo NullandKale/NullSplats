@@ -14,6 +14,7 @@ import json
 import math
 import random
 import os
+import sys
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
@@ -41,7 +42,7 @@ rasterization = None  # set after toolkit configuration
 def _configure_cuda_toolkit(cuda_path: Optional[str]) -> None:
     """Force the CUDA toolkit used by torch/cpp_extension to the preferred install."""
 
-    preferred = Path(cuda_path) if cuda_path else Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8")
+    preferred = Path(cuda_path) if cuda_path else Path(_default_cuda_path())
     cuda_home = preferred if preferred.exists() else Path(os.environ.get("CUDA_HOME", ""))
     if not cuda_home.exists():
         return
@@ -90,7 +91,7 @@ def _import_gsplat() -> None:
 class SplatTrainingConfig:
     """Training hyperparameters for gsplat optimization."""
 
-    cuda_toolkit_path: str = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+    cuda_toolkit_path: str = ""
     iterations: int = 3000
     snapshot_interval: int = 7000
     device: str = "cuda:0"
@@ -172,7 +173,7 @@ def train_scene(
 ) -> TrainingResult:
     """Train Gaussian splats on a scene using real COLMAP outputs and frames."""
 
-    _configure_cuda_toolkit(config.cuda_toolkit_path)
+    _configure_cuda_toolkit(config.cuda_toolkit_path or _default_cuda_path())
     _import_gsplat()
     if config.iterations <= 0:
         raise ValueError("iterations must be positive.")
@@ -955,3 +956,20 @@ def _ssim_loss(img_a: torch.Tensor, img_b: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = ["SplatTrainingConfig", "TrainingResult", "train_scene"]
+def _default_app_dir() -> Path:
+    """Resolve application root for bundled tools (dist or repo)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+def _default_cuda_path() -> str:
+    """Prefer bundled CUDA runtime, then env, then the system install."""
+    bundled = _default_app_dir() / "cuda"
+    if bundled.exists():
+        return str(bundled)
+    env_path = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME")
+    if env_path:
+        return env_path
+    return r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+
