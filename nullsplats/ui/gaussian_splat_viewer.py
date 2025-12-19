@@ -336,7 +336,7 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
     
     def set_gaussians(self, means: np.ndarray, scales: np.ndarray,
                      rotations: np.ndarray, opacities: np.ndarray,
-                     sh_dc: np.ndarray):
+                     sh_dc: np.ndarray, *, preserve_camera: bool = False):
         """Set Gaussian data for rendering.
         
         Args:
@@ -378,14 +378,15 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             self.scene_bounds_min = self.scene_center - 0.5
             self.scene_bounds_max = self.scene_center + 0.5
         
-        # CAMERA OUTSIDE SCENE - looking IN at center
-        # Place camera at MIN Z bound (in front), looking at center
         cam_x = self.scene_center[0]
         cam_y = self.scene_center[1]
         cam_z = self.scene_bounds_min[2] - max(self.scene_size * 0.5, 0.5)  # In front of scene with minimum offset
         
-        self.camera.set_position_direct(cam_x, cam_y, cam_z)
-        self.camera.set_target_direct(self.scene_center[0], self.scene_center[1], self.scene_center[2])
+        if not preserve_camera:
+            # CAMERA OUTSIDE SCENE - looking IN at center
+            # Place camera at MIN Z bound (in front), looking at center
+            self.camera.set_position_direct(cam_x, cam_y, cam_z)
+            self.camera.set_target_direct(self.scene_center[0], self.scene_center[1], self.scene_center[2])
         
         logger.info("=" * 80)
         logger.info(f"SCENE INFO:")
@@ -396,8 +397,9 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
         logger.info(f"  Center: ({self.scene_center[0]:.1f}, {self.scene_center[1]:.1f}, {self.scene_center[2]:.1f})")
         logger.info(f"  Size: {self.scene_size:.1f}")
         logger.info("CAMERA: In front of scene (at min Z - offset), looking at center")
-        logger.info(f"  Position: ({cam_x:.1f}, {cam_y:.1f}, {cam_z:.1f})")
-        logger.info(f"  Target: ({self.scene_center[0]:.1f}, {self.scene_center[1]:.1f}, {self.scene_center[2]:.1f})")
+        if not preserve_camera:
+            logger.info(f"  Position: ({cam_x:.1f}, {cam_y:.1f}, {cam_z:.1f})")
+            logger.info(f"  Target: ({self.scene_center[0]:.1f}, {self.scene_center[1]:.1f}, {self.scene_center[2]:.1f})")
         logger.info("=" * 80)
         
         # Store for later use

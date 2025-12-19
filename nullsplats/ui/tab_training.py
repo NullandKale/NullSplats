@@ -17,7 +17,7 @@ from typing import Optional, Tuple, List
 import numpy as np
 from nullsplats.app_state import AppState
 from nullsplats.backend.sfm_pipeline import SfmConfig, SfmResult, run_sfm
-from nullsplats.backend.splat_train import SplatTrainingConfig, TrainingResult, train_scene
+from nullsplats.backend.splat_train import PreviewPayload, SplatTrainingConfig, TrainingResult, train_scene
 from nullsplats.util.logging import get_logger
 from nullsplats.util.threading import run_in_background
 from nullsplats.ui.gl_canvas import GLCanvas
@@ -98,6 +98,9 @@ class TrainingTab:
         self.prune_opacity_var = tk.DoubleVar(value=default_cfg.prune_opacity_threshold)
         self.prune_scale_var = tk.DoubleVar(value=default_cfg.prune_scale_threshold)
         self.densify_max_points_var = tk.IntVar(value=default_cfg.densify_max_points)
+        self.preview_interval_var = tk.DoubleVar(value=default_cfg.preview_interval_seconds)
+        self.preview_min_iters_var = tk.IntVar(value=default_cfg.preview_min_iters)
+        self.preview_max_points_var = tk.IntVar(value=default_cfg.max_preview_points)
 
         self.scene_label: Optional[ttk.Label] = None
         self.scene_status_label: Optional[ttk.Label] = None
@@ -111,6 +114,11 @@ class TrainingTab:
         self._preview_cycle = 0
         self._preview_polling = False
         self._preview_toggle = tk.BooleanVar(value=True)
+        self._preview_queue: "queue.SimpleQueue[PreviewPayload]" = queue.SimpleQueue()
+        self._preview_drain_job: Optional[str] = None
+        self._preview_paused_for_sfm = False
+        self._preview_toggle_before_sfm = True
+        self._in_memory_preview_active = False
         self._tab_active = False
         self.training_preset_var = tk.StringVar(value="low")
         self._warmup_started = False
@@ -122,6 +130,7 @@ class TrainingTab:
         self._build_contents()
         self._apply_training_preset()  # default to medium preset settings
         self._update_scene_label()
+        self._schedule_preview_drain()
 
     def _register_control(self, widget: tk.Widget) -> None:
         """Track interactive widgets so we can disable/enable during training."""
@@ -332,6 +341,24 @@ class TrainingTab:
         ttk.Label(sh_frame, text="/").pack(side="left", padx=2)
         ttk.Spinbox(sh_frame, from_=1, to=100000, textvariable=self.sh_interval_var, width=8).pack(side="left")
 
+        row4 = ttk.Frame(training_body)
+        row4.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(row4, text="Preview interval (sec / min iters):").pack(side="left")
+        preview_frame = ttk.Frame(row4)
+        preview_frame.pack(side="left")
+        ttk.Spinbox(preview_frame, from_=0.1, to=60.0, increment=0.1, textvariable=self.preview_interval_var, width=6).pack(
+            side="left"
+        )
+        ttk.Label(preview_frame, text="/").pack(side="left", padx=2)
+        ttk.Spinbox(preview_frame, from_=0, to=100000, textvariable=self.preview_min_iters_var, width=8).pack(side="left")
+
+        row5 = ttk.Frame(training_body)
+        row5.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(row5, text="Preview max points (0=all):").pack(side="left")
+        ttk.Spinbox(row5, from_=0, to=2_000_000, textvariable=self.preview_max_points_var, width=12).pack(
+            side="left", padx=(4, 0)
+        )
+
         opt_body = self._collapsible_section(left_col, "Optimization", start_hidden=True)
         opt_row1 = ttk.Frame(opt_body)
         opt_row1.pack(fill="x", padx=6, pady=(6, 4))
@@ -448,6 +475,8 @@ class TrainingTab:
         if not self.preview_canvas:
             return
         if selected:
+            if self._preview_paused_for_sfm:
+                return
             if not self._warmup_started:
                 # Defer renderer warmup until the tab is visible to avoid slowing startup.
                 self._warmup_renderer(trigger="tab_select")
@@ -559,12 +588,12 @@ class TrainingTab:
             prune_opacity_threshold=float(self.prune_opacity_var.get()),
             prune_scale_threshold=float(self.prune_scale_var.get()),
             densify_max_points=int(self.densify_max_points_var.get()),
+            preview_interval_seconds=float(self.preview_interval_var.get()),
+            preview_min_iters=int(self.preview_min_iters_var.get()),
+            max_preview_points=int(self.preview_max_points_var.get()),
         )
-        # Keep preview rendering active during training if enabled.
-        if self.preview_canvas is not None:
-            self.preview_canvas.start_rendering()
-        self._preview_toggle.set(True)
-        self._toggle_preview_poll(force_on=True)
+        self._pause_preview_for_sfm()
+        self._in_memory_preview_active = True
         self._set_status("Running COLMAP then training...")
         self._reset_progress(indeterminate=True)
         self._working = True
@@ -594,6 +623,7 @@ class TrainingTab:
         sfm_config = SfmConfig(
             colmap_path=self.colmap_path_var.get().strip() or "colmap",
         )
+        self._pause_preview_for_sfm()
         self._working = True
         self._set_status("Running COLMAP...")
         self._reset_progress(indeterminate=True)
@@ -647,11 +677,15 @@ class TrainingTab:
             prune_opacity_threshold=float(self.prune_opacity_var.get()),
             prune_scale_threshold=float(self.prune_scale_var.get()),
             densify_max_points=int(self.densify_max_points_var.get()),
+            preview_interval_seconds=float(self.preview_interval_var.get()),
+            preview_min_iters=int(self.preview_min_iters_var.get()),
+            max_preview_points=int(self.preview_max_points_var.get()),
         )
         if self.preview_canvas is not None:
             self.preview_canvas.start_rendering()
         self._preview_toggle.set(True)
-        self._toggle_preview_poll(force_on=True)
+        self._preview_polling = False
+        self._in_memory_preview_active = True
         self._set_status("Training only...")
         self._reset_progress()
         self._working = True
@@ -674,17 +708,21 @@ class TrainingTab:
             config=sfm_config,
             cache_root=self.app_state.config.cache_root,
         )
+        self.frame.after(0, self._resume_preview_after_sfm)
         training_result = train_scene(
             scene_id,
             train_config,
             cache_root=self.app_state.config.cache_root,
             progress_callback=self._report_progress,
             checkpoint_callback=self._handle_checkpoint,
+            preview_callback=self._handle_preview_payload,
         )
         return sfm_result, training_result
 
     def _execute_sfm(self, scene_id: str, sfm_config: SfmConfig) -> SfmResult:
-        return run_sfm(scene_id, config=sfm_config, cache_root=self.app_state.config.cache_root)
+        result = run_sfm(scene_id, config=sfm_config, cache_root=self.app_state.config.cache_root)
+        self.frame.after(0, self._resume_preview_after_sfm)
+        return result
 
     def _execute_training(self, scene_id: str, train_config: SplatTrainingConfig) -> TrainingResult:
         return train_scene(
@@ -693,6 +731,7 @@ class TrainingTab:
             cache_root=self.app_state.config.cache_root,
             progress_callback=self._report_progress,
             checkpoint_callback=self._handle_checkpoint,
+            preview_callback=self._handle_preview_payload,
         )
 
     def _report_progress(self, iteration: int, total: int, metric: float) -> None:
@@ -738,9 +777,65 @@ class TrainingTab:
 
         self.frame.after(0, _update)
 
+    def _handle_preview_payload(self, payload: PreviewPayload) -> None:
+        try:
+            self._preview_queue.put_nowait(payload)
+        except Exception:
+            self.logger.debug("Preview payload dropped", exc_info=True)
+
+    def _schedule_preview_drain(self) -> None:
+        if not self.frame.winfo_exists():
+            return
+        self._preview_drain_job = self.frame.after(150, self._drain_preview_queue)
+
+    def _drain_preview_queue(self) -> None:
+        if not self.frame.winfo_exists():
+            return
+        latest: Optional[PreviewPayload] = None
+        while True:
+            try:
+                latest = self._preview_queue.get_nowait()
+            except Exception:
+                break
+        if latest is not None and not self._preview_paused_for_sfm:
+            if self.preview_canvas is not None and self._preview_toggle.get() and self._tab_active:
+                try:
+                    self.preview_canvas.start_rendering()
+                    self.preview_canvas.load_preview_data(latest)
+                    self.preview_status_var.set(
+                        f"In-memory preview (iter {latest.iteration}, {latest.means.shape[0]} pts)"
+                    )
+                except Exception:
+                    self.logger.debug("Preview apply failed", exc_info=True)
+        self._schedule_preview_drain()
+
+    def _pause_preview_for_sfm(self) -> None:
+        if self._preview_paused_for_sfm:
+            return
+        self._preview_toggle_before_sfm = bool(self._preview_toggle.get())
+        self._preview_paused_for_sfm = True
+        self._preview_polling = False
+        if self.preview_canvas is not None:
+            try:
+                self.preview_canvas.stop_rendering()
+            except Exception:
+                self.logger.debug("Failed to stop preview rendering for SFM", exc_info=True)
+
+    def _resume_preview_after_sfm(self) -> None:
+        if not self._preview_paused_for_sfm:
+            return
+        self._preview_paused_for_sfm = False
+        if not self._preview_toggle_before_sfm:
+            return
+        if self.preview_canvas is not None:
+            self.preview_canvas.start_rendering()
+        if self._tab_active:
+            self._toggle_preview_poll(force_on=True)
+
     def _handle_pipeline_success(self, result: Tuple[SfmResult | None, TrainingResult]) -> None:
         _sfm_result, training_result = result
         self._working = False
+        self._in_memory_preview_active = False
         self._set_controls_enabled(True)
         self.app_state.refresh_scene_status()
         self._update_scene_label()
@@ -752,6 +847,7 @@ class TrainingTab:
 
     def _handle_sfm_success(self, sfm_result: SfmResult) -> None:
         self._working = False
+        self._in_memory_preview_active = False
         self._set_controls_enabled(True)
         self.app_state.refresh_scene_status()
         self._update_scene_label()
@@ -760,6 +856,7 @@ class TrainingTab:
 
     def _handle_error(self, exc: Exception) -> None:
         self._working = False
+        self._in_memory_preview_active = False
         self._set_controls_enabled(True)
         self._reset_progress()
         self.logger.exception("Training tab operation failed")
@@ -859,6 +956,10 @@ print(json.dumps({{"render_time_ms": float(info.get("render_time_ms", 0.0))}}))
         run_in_background(_do_warmup, tk_root=self.frame, on_success=_on_success, on_error=_on_error, thread_name="warmup_renderer")
 
     def _toggle_preview_poll(self, force_on: bool = False) -> None:
+        if self._preview_paused_for_sfm:
+            return
+        if self._in_memory_preview_active:
+            return
         desired = bool(self._preview_toggle.get()) or force_on
         if desired and not self._preview_polling and self._tab_active:
             self._preview_polling = True
@@ -889,6 +990,8 @@ print(json.dumps({{"render_time_ms": float(info.get("render_time_ms", 0.0))}}))
         self.frame.after(3000, self._poll_latest_checkpoint)
 
     def _poll_latest_checkpoint(self, force: bool = False) -> None:
+        if self._in_memory_preview_active:
+            return
         if (not self._preview_polling and not force) or not self._tab_active:
             self.logger.debug(
                 "Preview poll skipped force=%s polling=%s tab_active=%s", force, self._preview_polling, self._tab_active
@@ -1035,6 +1138,8 @@ print(json.dumps({{"render_time_ms": float(info.get("render_time_ms", 0.0))}}))
 
     def _ensure_preview_running(self) -> None:
         if not self.preview_canvas:
+            return
+        if self._preview_paused_for_sfm:
             return
         self._clear_stale_preview_for_scene()
         if self._preview_toggle.get():

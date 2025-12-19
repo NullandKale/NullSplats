@@ -15,6 +15,7 @@ import math
 import random
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
@@ -34,6 +35,7 @@ logger = get_logger("splat_train")
 LOG_PROGRESS_INTERVAL = 100
 ProgressCallback = Callable[[int, int, float], None]
 CheckpointCallback = Callable[[int, Path], None]
+PreviewCallback = Callable[["PreviewPayload"], None]
 gsplat = None  # set after toolkit configuration
 rasterization = None  # set after toolkit configuration
 _SSIM_AVAILABLE = True
@@ -140,6 +142,9 @@ class SplatTrainingConfig:
     random_background: bool = False
     loss_l1_weight: float = 1.0
     seed: int = 42
+    preview_interval_seconds: float = 1.0
+    preview_min_iters: int = 100
+    max_preview_points: int = 0
 
 
 @dataclass(frozen=True)
@@ -153,6 +158,18 @@ class TrainingResult:
     export_format: str
     log_path: Path
     config_path: Path
+
+
+@dataclass(frozen=True)
+class PreviewPayload:
+    """Lightweight splat payload for in-memory previews."""
+
+    iteration: int
+    means: torch.Tensor
+    scales_log: torch.Tensor
+    quats_wxyz: torch.Tensor
+    opacities: torch.Tensor
+    sh_dc: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -176,6 +193,7 @@ def train_scene(
     cache_root: str | Path = "cache",
     progress_callback: ProgressCallback | None = None,
     checkpoint_callback: CheckpointCallback | None = None,
+    preview_callback: PreviewCallback | None = None,
 ) -> TrainingResult:
     """Train Gaussian splats on a scene using real COLMAP outputs and frames."""
 
@@ -324,6 +342,8 @@ def train_scene(
     if checkpoint_callback is not None:
         checkpoint_callback(0, last_checkpoint)
 
+    last_preview_time = time.perf_counter()
+    last_preview_iter = 0
     for iteration in range(1, config.iterations + 1):
         batch = _sample_frames(frames, config.batch_size)
         embed_ids = torch.tensor([f.index for f in batch], device=device, dtype=torch.long)
@@ -452,6 +472,44 @@ def train_scene(
                 float(scales.mean().item()),
                 float(opacities.mean().item()),
             )
+
+        if preview_callback is not None and config.preview_interval_seconds > 0.0:
+            now = time.perf_counter()
+            is_forced = iteration in (1, config.iterations)
+            ready_by_time = (now - last_preview_time) >= config.preview_interval_seconds
+            ready_by_iters = (
+                config.preview_min_iters <= 0 or (iteration - last_preview_iter) >= config.preview_min_iters
+            )
+            if is_forced or (ready_by_time and ready_by_iters):
+                last_preview_time = now
+                last_preview_iter = iteration
+                with torch.no_grad():
+                    means_preview = splats_param["means"].detach()
+                    scales_log_preview = splats_param["scales"].detach()
+                    quats_preview = F.normalize(splats_param["quats"].detach(), dim=1)
+                    opacities_preview = torch.sigmoid(splats_param["opacities"].detach())
+                    sh_dc_preview = splats_param["sh0"].detach()[:, 0, :]
+
+                    if config.max_preview_points > 0 and means_preview.shape[0] > config.max_preview_points:
+                        keep = torch.topk(opacities_preview, config.max_preview_points).indices
+                        means_preview = means_preview[keep]
+                        scales_log_preview = scales_log_preview[keep]
+                        quats_preview = quats_preview[keep]
+                        opacities_preview = opacities_preview[keep]
+                        sh_dc_preview = sh_dc_preview[keep]
+
+                    payload = PreviewPayload(
+                        iteration=iteration,
+                        means=means_preview.detach().cpu(),
+                        scales_log=scales_log_preview.detach().cpu(),
+                        quats_wxyz=quats_preview.detach().cpu(),
+                        opacities=opacities_preview.detach().cpu(),
+                        sh_dc=sh_dc_preview.detach().cpu(),
+                    )
+                try:
+                    preview_callback(payload)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Preview callback failed at iteration %d", iteration)
 
         if iteration % config.snapshot_interval == 0 or iteration == config.iterations:
             last_checkpoint = _checkpoint_path(iteration)
@@ -966,7 +1024,7 @@ def _ssim_loss(img_a: torch.Tensor, img_b: torch.Tensor) -> torch.Tensor:
     return metric(a, b)
 
 
-__all__ = ["SplatTrainingConfig", "TrainingResult", "train_scene"]
+__all__ = ["SplatTrainingConfig", "TrainingResult", "PreviewPayload", "train_scene"]
 def _default_app_dir() -> Path:
     """Resolve application root for bundled tools (dist or repo)."""
     if getattr(sys, "frozen", False):

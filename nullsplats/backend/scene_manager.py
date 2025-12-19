@@ -318,7 +318,7 @@ class ThumbnailCache:
         if data:
             with self._lock:
                 self._thumbs.setdefault(scene_key, {})[filename] = data
-                self._save_db()
+            self._save_db()
         return data
 
     def _make_thumb_bytes(self, path: Path) -> Optional[bytes]:

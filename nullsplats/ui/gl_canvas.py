@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from nullsplats.backend.io_cache import ScenePaths
+from nullsplats.backend.splat_train import PreviewPayload
 from nullsplats.util.logging import get_logger
 
 
@@ -491,6 +492,49 @@ class GLCanvas(ttk.Frame):
             logger.debug("Failed to capture viewer camera", exc_info=True)
             return None
 
+    def _capture_viewer_pose(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        viewer = self._viewer
+        if viewer is None:
+            return None
+        try:
+            cam = getattr(viewer, "camera", None)
+            if cam is None:
+                return None
+            pos = np.array(cam.position, dtype=np.float32)
+            target = np.array(cam.target, dtype=np.float32)
+            return pos, target
+        except Exception:  # noqa: BLE001
+            logger.debug("Failed to capture viewer pose", exc_info=True)
+            return None
+
+    def _apply_viewer_pose(self, pos: np.ndarray, target: np.ndarray) -> None:
+        if self._viewer is None:
+            return
+        try:
+            eye = torch.tensor(pos, dtype=torch.float32)
+            tgt = torch.tensor(target, dtype=torch.float32)
+            up = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32)
+            view = _look_at_torch(eye, tgt, up)
+            rotation = view[:3, :3].detach().cpu().numpy()
+            self._viewer.set_camera_pose(
+                eye.detach().cpu().numpy(),
+                rotation=rotation,
+                target=tgt.detach().cpu().numpy(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Failed to apply viewer pose", exc_info=True)
+
+    def _view_from_pose(self, pos: np.ndarray, target: np.ndarray) -> CameraView:
+        direction = target - pos
+        distance = float(np.linalg.norm(direction))
+        yaw, pitch = _vector_to_angles(torch.tensor(direction))
+        return CameraView(
+            yaw=float(yaw),
+            pitch=float(pitch),
+            distance=max(distance, 0.001),
+            target=torch.tensor(target, dtype=torch.float32),
+        )
+
     def load_splat(self, path: Path) -> None:
         target = Path(path)
         with self._load_lock:
@@ -526,6 +570,78 @@ class GLCanvas(ttk.Frame):
         self._load_thread = thread
         thread.start()
         logger.info("GLCanvas load dispatched request=%d path=%s", request_id, target)
+
+    def load_preview_data(self, payload: PreviewPayload) -> None:
+        """Apply an in-memory splat payload without touching disk."""
+        if self._viewer is None:
+            logger.info("GLCanvas preview skipped (no viewer)")
+            return
+        if not self.winfo_exists():
+            logger.info("GLCanvas preview skipped (widget destroyed)")
+            return
+        prior_pose = self._capture_viewer_pose()
+        prior_view = self._capture_viewer_camera() or self._current_view
+        try:
+            means = _to_numpy(payload.means)
+            scales = _to_numpy(payload.scales_log)
+            quats_wxyz = _to_numpy(payload.quats_wxyz)
+            opacities = _to_numpy(payload.opacities)
+            sh_dc = _to_numpy(payload.sh_dc)
+
+            if means.size == 0:
+                logger.info("GLCanvas preview skipped (empty payload)")
+                return
+
+            quats = np.ascontiguousarray(quats_wxyz[:, [1, 2, 3, 0]])
+            self._viewer.set_gaussians(means, scales, quats, opacities, sh_dc, preserve_camera=True)
+
+            center_np = means.mean(axis=0)
+            center = torch.tensor(center_np, dtype=torch.float32)
+            radius = float(np.linalg.norm(means - center_np, axis=1).max())
+            radius = radius if radius > 1e-5 else 1.0
+            data = SplatData(
+                means=torch.from_numpy(means),
+                scales_log=torch.from_numpy(scales),
+                quats=torch.from_numpy(quats_wxyz),
+                opacities=torch.from_numpy(opacities),
+                colors=torch.from_numpy(sh_dc).unsqueeze(1),
+                sh_degree=0,
+                center=center,
+                radius=radius,
+                path=Path("__preview__"),
+            )
+            self.renderer.data = data
+
+            if prior_pose is not None:
+                self._apply_viewer_pose(*prior_pose)
+                self._current_view = self._view_from_pose(*prior_pose)
+            elif prior_view is not None:
+                self._current_view = prior_view
+                self._update_viewer_camera(prior_view)
+            elif self._current_view is None:
+                view = _fallback_view(data, self._current_view)
+                self._current_view = view
+                self._update_viewer_camera(view)
+
+            self._notify_camera_listeners(self._current_view)
+            self.start_rendering()
+            if hasattr(self._viewer, "request_depth_sort"):
+                try:
+                    self._viewer.request_depth_sort()
+                except Exception:  # noqa: BLE001
+                    logger.debug("Depth sort request failed", exc_info=True)
+            if hasattr(self._viewer, "render_once"):
+                try:
+                    self._viewer.render_once()
+                except Exception:  # noqa: BLE001
+                    logger.debug("Render-once failed", exc_info=True)
+            logger.info(
+                "GLCanvas preview applied iteration=%d gaussians=%d",
+                payload.iteration,
+                means.shape[0],
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("GLCanvas failed to upload preview payload")
 
     @property
     def last_path(self) -> Optional[Path]:
@@ -765,6 +881,16 @@ def _collect_rest_props(arr: np.ndarray) -> List[str]:
             props.append(name)
     props.sort(key=lambda n: int(n.split("_")[-1]))
     return props
+
+
+def _to_numpy(data: np.ndarray | torch.Tensor) -> np.ndarray:
+    if isinstance(data, np.ndarray):
+        arr = data
+    else:
+        arr = data.detach().cpu().numpy()
+    if arr.dtype != np.float32:
+        arr = arr.astype(np.float32)
+    return np.ascontiguousarray(arr)
 
 
 def _look_at_torch(eye: torch.Tensor, target: torch.Tensor, up: torch.Tensor) -> torch.Tensor:

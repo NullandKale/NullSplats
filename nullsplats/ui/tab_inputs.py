@@ -83,7 +83,7 @@ class InputsTab:
         self._scene_thumb_labels: dict[str, ttk.Label] = {}
         self._thumb_workers: int = 0
         self._max_thumb_workers: int = 4
-        self._thumb_inflight: set[str] = set()
+        self._thumb_inflight: set[tuple[str, str]] = set()
         style = ttk.Style()
         try:
             style.configure("ActiveCard.TFrame", background="#dbeafe")
@@ -818,29 +818,35 @@ class InputsTab:
         )
 
     def _drain_thumbnail_queue(self, result: ExtractionResult, chunk_size: int = 8) -> None:
-        if self.current_result is None or result.scene_id != self.current_result.scene_id:
+        try:
+            if self.current_result is None or result.scene_id != self.current_result.scene_id:
+                self._thumbnail_job = None
+                self._thumb_queue.clear()
+                return
+            loaded = 0
+            while self._thumb_queue and loaded < chunk_size and self._thumb_workers < self._max_thumb_workers:
+                name = self._thumb_queue.pop(0)
+                self._load_thumbnail_async(str(result.scene_id), name)
+                loaded += 1
+            if self._thumb_queue:
+                self._thumbnail_job = self.frame.after(10, lambda: self._drain_thumbnail_queue(result, chunk_size))
+            else:
+                self._thumbnail_job = None
+        except Exception as exc:
             self._thumbnail_job = None
-            self._thumb_queue.clear()
-            return
-        loaded = 0
-        while self._thumb_queue and loaded < chunk_size and self._thumb_workers < self._max_thumb_workers:
-            name = self._thumb_queue.pop(0)
-            self._load_thumbnail_async(str(result.scene_id), name)
-            loaded += 1
-        if self._thumb_queue:
-            self._thumbnail_job = self.frame.after(10, lambda: self._drain_thumbnail_queue(result, chunk_size))
-        else:
-            self._thumbnail_job = None
+            self.logger.debug("Thumbnail queue drain failed scene=%s exc=%s", result.scene_id, exc)
+            self._schedule_thumbnail_job()
 
     def _load_thumbnail_async(self, scene_id: str, filename: str) -> None:
         cache_key = (scene_id, filename)
         if cache_key in self._thumb_cache:
             self._apply_thumbnail(filename, self._thumb_cache[cache_key])
             return
-        if filename in self._thumb_inflight:
+        inflight_key = (scene_id, filename)
+        if inflight_key in self._thumb_inflight:
             return
         self._thumb_workers += 1
-        self._thumb_inflight.add(filename)
+        self._thumb_inflight.add(inflight_key)
         done = {"value": False}
 
         def _load_bytes() -> tuple[str, Optional[bytes]]:
@@ -853,7 +859,7 @@ class InputsTab:
                 if done["value"]:
                     return
                 done["value"] = True
-                self._thumb_inflight.discard(fname)
+                self._thumb_inflight.discard((scene_id, fname))
                 if self.current_result is None or scene_id != str(self.current_result.scene_id):
                     return
                 if data:
@@ -873,7 +879,7 @@ class InputsTab:
             if done["value"]:
                 return
             done["value"] = True
-            self._thumb_inflight.discard(filename)
+            self._thumb_inflight.discard((scene_id, filename))
             self.logger.debug("Thumbnail load failed file=%s exc=%s", filename, exc)
             self._thumb_workers = max(0, self._thumb_workers - 1)
             self._schedule_thumbnail_job()
@@ -882,7 +888,7 @@ class InputsTab:
             if done["value"]:
                 return
             done["value"] = True
-            self._thumb_inflight.discard(filename)
+            self._thumb_inflight.discard((scene_id, filename))
             self._thumb_workers = max(0, self._thumb_workers - 1)
             self._schedule_thumbnail_job()
 
@@ -892,13 +898,19 @@ class InputsTab:
         except Exception:
             pass
 
-        run_in_background(
-            _load_bytes,
-            tk_root=self.frame,
-            on_success=_on_success,
-            on_error=_on_error,
-            thread_name=f"thumb_{filename}",
-        )
+        try:
+            run_in_background(
+                _load_bytes,
+                tk_root=self.frame,
+                on_success=_on_success,
+                on_error=_on_error,
+                thread_name=f"thumb_{filename}",
+            )
+        except Exception as exc:
+            self._thumb_inflight.discard(inflight_key)
+            self._thumb_workers = max(0, self._thumb_workers - 1)
+            self.logger.debug("Thumbnail thread start failed file=%s exc=%s", filename, exc)
+            self._schedule_thumbnail_job()
 
     def _apply_thumbnail(self, filename: str, photo: tk.PhotoImage) -> None:
         self.thumbnail_refs.append(photo)
