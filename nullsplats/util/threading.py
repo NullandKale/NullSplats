@@ -1,8 +1,7 @@
 """Background task helper for Tkinter applications.
 
 Tasks run on a worker thread, with callbacks routed back onto the Tk event loop
-to keep UI updates thread-safe. Logging captures the life-cycle of the task so
-background work is visible for debugging.
+to keep UI updates thread-safe.
 """
 
 from __future__ import annotations
@@ -53,10 +52,8 @@ def run_in_background(
 
     def _worker() -> None:
         label = thread_name or func.__name__
-        _logger.info("Background task start: %s", label)
         try:
             result = func(*args, **kwargs)
-            _logger.info("Background task completed: %s", label)
             if on_success is not None:
                 _dispatch_to_ui(lambda res=result: on_success(res))
         except Exception as exc:  # noqa: BLE001 - forward errors to handler

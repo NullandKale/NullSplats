@@ -4,9 +4,7 @@ Tkinter + OpenGL desktop app for training and viewing 3D Gaussian splats from ca
 
 ## What it does
 
-
 https://github.com/user-attachments/assets/6bcda99b-5d9d-4960-a759-5008b4bdc766
-
 
 - Ingest a video or image folder, extract and score frames, and auto-select a subset.
 - Run COLMAP SfM to produce camera poses and sparse points.

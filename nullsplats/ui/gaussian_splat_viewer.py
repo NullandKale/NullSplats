@@ -1025,15 +1025,6 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             up_world = R_T @ up_cam
             self.camera.up = up_world
             
-            logger.info(
-                "Camera set with rotation - position: (%.2f, %.2f, %.2f), target: (%.2f, %.2f, %.2f)",
-                position[0],
-                position[1],
-                position[2],
-                final_target[0],
-                final_target[1],
-                final_target[2],
-            )
         elif target is not None:
             self.camera.set_target_direct(target[0], target[1], target[2])
             logger.info(f"Camera set with target - position: ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}), target: ({target[0]:.2f}, {target[1]:.2f}, {target[2]:.2f})")
