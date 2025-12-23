@@ -342,15 +342,14 @@ class GuidedWizard(tk.Toplevel):
         if self.training_tab is None:
             return
         try:
-            self.training_tab.training_preset_var.set(self.preset_var.get())
-            self.training_tab._apply_training_preset()
-            self.training_tab._run_pipeline()
+            self.training_tab.apply_training_preset(self.preset_var.get())
+            self.training_tab.run_pipeline()
             self.after(1000, self._wait_for_training)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Wizard", f"Training failed: {exc}", parent=self)
 
     def _wait_for_training(self) -> None:
-        if getattr(self.training_tab, "_working", False):
+        if self.training_tab is not None and self.training_tab.is_working():
             self.after(1000, self._wait_for_training)
             return
         # Jump to exports and select latest

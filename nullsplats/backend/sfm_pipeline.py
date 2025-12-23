@@ -15,12 +15,12 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
-import sys
 from typing import Iterable, List
 
 from nullsplats.backend.io_cache import ScenePaths, ensure_scene_dirs
 from nullsplats.util.logging import get_logger
 from nullsplats.util.scene_id import SceneId
+from nullsplats.util.tooling_paths import default_colmap_path
 
 
 logger = get_logger("sfm_pipeline")
@@ -70,7 +70,7 @@ def run_sfm(
     normalized_scene = SceneId(str(scene_id))
     paths = ensure_scene_dirs(normalized_scene, cache_root=cache_root)
     _require_frames(paths.frames_selected_dir)
-    colmap_exe = config.colmap_path or _default_colmap_path()
+    colmap_exe = config.colmap_path or default_colmap_path()
     _assert_executable(colmap_exe, "COLMAP")
 
     sfm_dir = paths.sfm_dir
@@ -262,7 +262,7 @@ def _ensure_dll_search_paths(colmap_path: str, stack: ExitStack) -> None:
 
 def _log_binary_details(colmap_path: str, log_file) -> None:
     """Write basic binary diagnostics for troubleshooting."""
-    for label, path_str in (("COLMAP", colmap_path or _default_colmap_path()),):
+    for label, path_str in (("COLMAP", colmap_path or default_colmap_path()),):
         path = Path(path_str)
         exists = path.exists()
         size = path.stat().st_size if exists else 0
@@ -301,22 +301,6 @@ def _describe_failure(code: int) -> str:
     if code in {3221225477, -1073741819}:  # STATUS_ACCESS_VIOLATION
         return " (access violation; check GPU/driver and binary compatibility)"
     return f" (exit 0x{code:08X})"
-
-
-def _default_app_dir() -> Path:
-    """Resolve the root folder where tools are expected (dist or repo)."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parents[2]
-
-
-def _default_colmap_path() -> str:
-    """Prefer a bundled COLMAP; fall back to the repo-local tools copy."""
-    bundled = _default_app_dir() / "tools" / "colmap" / "COLMAP.bat"
-    if bundled.exists():
-        return str(bundled)
-    repo_default = Path(r"C:\Users\alec\source\python\NullSplats\tools\colmap\COLMAP.bat")
-    return str(repo_default)
 
 
 __all__ = ["SfmConfig", "SfmResult", "run_sfm"]
