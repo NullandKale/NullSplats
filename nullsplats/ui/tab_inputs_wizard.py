@@ -35,6 +35,10 @@ class InputsTabWizardMixin:
         if self._extracting:
             self.frame.after(500, self._wizard_wait_for_extract)
             return
+        if self.current_result is None or not self.current_result.available_frames:
+            messagebox.showerror("Wizard", "Extraction did not produce frames. Check the input and try again.", parent=self.frame.winfo_toplevel())
+            self._wizard_running = False
+            return
         self._persist_selection()
         self.frame.after(500, self._wizard_wait_for_save)
 

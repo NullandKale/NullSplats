@@ -10,9 +10,12 @@ import queue
 import subprocess
 import sys
 from tkinter import scrolledtext, ttk
-from typing import Optional
+from typing import Any, Optional
 from nullsplats.app_state import AppState
-from nullsplats.backend.splat_train import PreviewPayload, SplatTrainingConfig, TrainingResult, train_scene
+from nullsplats.backend.splat_backends.dispatch import train_with_trainer
+from nullsplats.backend.splat_backends.registry import get_trainer, list_trainers
+from nullsplats.backend.splat_backends.types import TrainingOutput
+from nullsplats.backend.splat_train_config import PreviewPayload, SplatTrainingConfig
 from nullsplats.util.logging import get_logger
 from nullsplats.util.tooling_paths import app_root, default_cuda_path
 from nullsplats.util.threading import run_in_background
@@ -31,6 +34,10 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
         self.frame = ttk.Frame(master)
 
         default_cfg = SplatTrainingConfig()
+        trainers = list_trainers()
+        self._trainers = {trainer.name: trainer for trainer in trainers}
+        self.training_method_var = tk.StringVar(value="gsplat")
+        self.method_hint_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Configure training, then run.")
         self.preview_status_var = tk.StringVar(value="Viewer idle.")
         self.sfm_hint_var = tk.StringVar(value="")
@@ -64,6 +71,17 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
         self.preview_interval_var = tk.DoubleVar(value=default_cfg.preview_interval_seconds)
         self.preview_min_iters_var = tk.IntVar(value=default_cfg.preview_min_iters)
         self.preview_max_points_var = tk.IntVar(value=default_cfg.max_preview_points)
+        self.da3_pretrained_id_var = tk.StringVar(value="depth-anything/DA3NESTED-GIANT-LARGE")
+        self.da3_process_res_var = tk.IntVar(value=504)
+        self.da3_process_res_method_var = tk.StringVar(value="upper_bound_resize")
+        self.da3_ref_view_var = tk.StringVar(value="saddle_balanced")
+        self.da3_use_ray_pose_var = tk.BooleanVar(value=False)
+        self.da3_gs_views_interval_var = tk.IntVar(value=1)
+        self.da3_use_input_res_var = tk.BooleanVar(value=False)
+        self.da3_view_stride_var = tk.IntVar(value=1)
+        self.da3_max_views_var = tk.IntVar(value=20)
+        self.da3_align_scale_var = tk.BooleanVar(value=True)
+        self.da3_infer_gs_var = tk.BooleanVar(value=True)
 
         self.scene_label: Optional[ttk.Label] = None
         self.scene_status_label: Optional[ttk.Label] = None
@@ -88,11 +106,14 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
         self._interactive_controls: list[tk.Widget] = []
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_bar: Optional[ttk.Progressbar] = None
+        self._gsplat_section_visible = True
+        self._da3_section_visible = False
 
         self._build_contents()
         self._apply_training_preset()  # default to medium preset settings
         self._update_scene_label()
         self._schedule_preview_drain()
+        self._apply_trainer_capabilities()
 
     def _reset_progress(self, *, indeterminate: bool = False) -> None:
         if self.progress_bar is None:
@@ -209,57 +230,35 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
         if self._working:
             self._set_status("Another operation is running; wait for it to finish.", is_error=True)
             return
-        self._apply_training_preset()
+        method = self._selected_trainer_name()
+        if method == "gsplat":
+            self._apply_training_preset()
         scene_id = self._require_scene()
         if scene_id is None:
             return
         if not self._has_sfm_outputs(scene_id):
             self._set_status("COLMAP outputs not found. Run COLMAP first.", is_error=True)
             return
-        train_config = SplatTrainingConfig(
-            cuda_toolkit_path=self.cuda_path_var.get().strip() or SplatTrainingConfig().cuda_toolkit_path,
-            iterations=int(self.iterations_var.get()),
-            snapshot_interval=int(self.snapshot_var.get()),
-            max_points=int(self.max_points_var.get()),
-            export_format=self.export_format_var.get().strip() or "ply",
-            device=self.device_var.get().strip() or "cuda:0",
-            image_downscale=int(self.image_downscale_var.get()),
-            batch_size=int(self.batch_size_var.get()),
-            sh_degree=int(self.sh_degree_var.get()),
-            sh_degree_interval=int(self.sh_interval_var.get()),
-            init_scale=float(self.init_scale_var.get()),
-            min_scale=float(self.min_scale_var.get()),
-            max_scale=float(self.max_scale_var.get()),
-            opacity_bias=float(self.opacity_bias_var.get()),
-            random_background=bool(self.random_background_var.get()),
-            means_lr=float(self.means_lr_var.get()),
-            scales_lr=float(self.scales_lr_var.get()),
-            opacities_lr=float(self.opacities_lr_var.get()),
-            sh_lr=float(self.sh_lr_var.get()),
-            lr_final_scale=float(self.lr_final_scale_var.get()),
-            densify_start=int(self.densify_start_var.get()),
-            densify_interval=int(self.densify_interval_var.get()),
-            densify_opacity_threshold=float(self.densify_opacity_var.get()),
-            densify_scale_threshold=float(self.densify_scale_var.get()),
-            prune_opacity_threshold=float(self.prune_opacity_var.get()),
-            prune_scale_threshold=float(self.prune_scale_var.get()),
-            densify_max_points=int(self.densify_max_points_var.get()),
-            preview_interval_seconds=float(self.preview_interval_var.get()),
-            preview_min_iters=int(self.preview_min_iters_var.get()),
-            max_preview_points=int(self.preview_max_points_var.get()),
-        )
-        if self.preview_canvas is not None:
+        train_config = self._build_training_config(method)
+        if self.preview_canvas is not None and method == "gsplat":
             self.preview_canvas.start_rendering()
-        self._preview_toggle.set(True)
-        self._preview_polling = False
-        self._in_memory_preview_active = True
+        if method == "gsplat":
+            self._preview_toggle.set(True)
+            self._preview_polling = False
+            self._in_memory_preview_active = True
+        else:
+            self._preview_toggle.set(False)
+            self._preview_polling = False
+            self._in_memory_preview_active = False
+            self.preview_status_var.set("Live preview unavailable for this method.")
         self._set_status("Training only...")
-        self._reset_progress()
+        self._reset_progress(indeterminate=method != "gsplat")
         self._working = True
         self._set_controls_enabled(False)
         run_in_background(
             self._execute_training,
             scene_id,
+            method,
             train_config,
             tk_root=self.frame.winfo_toplevel(),
             on_success=self._handle_training_success,
@@ -267,14 +266,22 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
             thread_name=f"train_only_{scene_id}",
         )
 
-    def _execute_training(self, scene_id: str, train_config: SplatTrainingConfig) -> TrainingResult:
-        return train_scene(
+    def _execute_training(self, scene_id: str, trainer_name: str, train_config: dict[str, Any] | SplatTrainingConfig) -> TrainingOutput:
+        preview_callback = None
+        try:
+            trainer = get_trainer(trainer_name)
+            if trainer.capabilities.live_preview:
+                preview_callback = self._handle_preview_payload
+        except Exception:
+            preview_callback = self._handle_preview_payload if trainer_name == "gsplat" else None
+        return train_with_trainer(
             scene_id,
+            trainer_name,
             train_config,
             cache_root=self.app_state.config.cache_root,
             progress_callback=self._report_progress,
             checkpoint_callback=self._handle_checkpoint,
-            preview_callback=self._handle_preview_payload,
+            preview_callback=preview_callback,
         )
 
     def _report_progress(self, iteration: int, total: int, metric: float) -> None:
@@ -320,7 +327,7 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
 
         self.frame.after(0, _update)
 
-    def _handle_training_success(self, training_result: TrainingResult) -> None:
+    def _handle_training_success(self, training_result: TrainingOutput) -> None:
         self._working = False
         self._in_memory_preview_active = False
         self._set_controls_enabled(True)
@@ -328,7 +335,7 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
         self._update_scene_label()
         self._set_progress(1.0)
         self._set_status(
-            f"Training finished. Last checkpoint: {training_result.last_checkpoint}",
+            f"Training finished. Last checkpoint: {training_result.primary_path}",
             is_error=False,
         )
 
@@ -353,6 +360,10 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
 
     def _apply_training_preset(self) -> None:
         preset = self.training_preset_var.get()
+        self._apply_gsplat_preset(preset)
+        self._apply_da3_preset(preset)
+
+    def _apply_gsplat_preset(self, preset: str) -> None:
         if preset == "high":
             iterations = 30_000
             max_points = 2_500_000
@@ -381,6 +392,21 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
         self.densify_max_points_var.set(max_points)
         self.prune_opacity_var.set(prune_opacity)
         self.prune_scale_var.set(prune_scale)
+
+    def _apply_da3_preset(self, preset: str) -> None:
+        if preset == "high":
+            self.da3_process_res_var.set(720)
+            self.da3_process_res_method_var.set("lower_bound_resize")
+            self.da3_max_views_var.set(50)
+        elif preset == "medium":
+            self.da3_process_res_var.set(504)
+            self.da3_process_res_method_var.set("lower_bound_resize")
+            self.da3_max_views_var.set(20)
+        else:
+            self.da3_process_res_var.set(504)
+            self.da3_process_res_method_var.set("upper_bound_resize")
+            self.da3_max_views_var.set(10)
+        self.da3_view_stride_var.set(1)
 
     def _warmup_renderer(self, trigger: str = "manual") -> None:
         """Pre-compile gsplat rasterization in a subprocess to avoid UI blocking."""
@@ -478,6 +504,102 @@ print(json.dumps({{"render_time_ms": float(info.get("render_time_ms", 0.0))}}))
         if enabled and self._preview_toggle.get() and self._tab_active:
             self._toggle_preview_poll(force_on=True)
             self._poll_latest_checkpoint(force=True)
+
+    def _selected_trainer_name(self) -> str:
+        name = self.training_method_var.get().strip().lower()
+        return name or "gsplat"
+
+    def _apply_trainer_capabilities(self) -> None:
+        name = self._selected_trainer_name()
+        trainer = self._trainers.get(name)
+        if trainer is None:
+            self.preview_status_var.set("Unknown training method.")
+            self.method_hint_var.set("Select a valid training method.")
+            return
+        hint = "Live preview available." if trainer.capabilities.live_preview else "Live preview unavailable."
+        self.method_hint_var.set(hint)
+        self._show_method_sections(name)
+        if trainer.capabilities.live_preview:
+            if self.preview_canvas is not None and self._tab_active:
+                self.preview_canvas.start_rendering()
+            self.preview_status_var.set("Viewer idle.")
+            return
+        self._preview_toggle.set(False)
+        self._preview_polling = False
+        self._in_memory_preview_active = False
+        self.preview_status_var.set("Live preview unavailable for this method.")
+
+    def _show_method_sections(self, method: str) -> None:
+        if not hasattr(self, "gsplat_settings_frame") or not hasattr(self, "da3_settings_frame"):
+            return
+        if method == "gsplat":
+            if not self._gsplat_section_visible:
+                self.gsplat_settings_frame.pack(fill="x", padx=10, pady=(0, 6))
+                self._gsplat_section_visible = True
+            if self._da3_section_visible:
+                self.da3_settings_frame.pack_forget()
+                self._da3_section_visible = False
+        elif method == "depth_anything_3":
+            if self._gsplat_section_visible:
+                self.gsplat_settings_frame.pack_forget()
+                self._gsplat_section_visible = False
+            if not self._da3_section_visible:
+                self.da3_settings_frame.pack(fill="x", padx=10, pady=(0, 6))
+                self._da3_section_visible = True
+
+    def _build_training_config(self, method: str) -> dict[str, Any] | SplatTrainingConfig:
+        if method == "gsplat":
+            return SplatTrainingConfig(
+                cuda_toolkit_path=self.cuda_path_var.get().strip() or SplatTrainingConfig().cuda_toolkit_path,
+                iterations=int(self.iterations_var.get()),
+                snapshot_interval=int(self.snapshot_var.get()),
+                max_points=int(self.max_points_var.get()),
+                export_format=self.export_format_var.get().strip() or "ply",
+                device=self.device_var.get().strip() or "cuda:0",
+                image_downscale=int(self.image_downscale_var.get()),
+                batch_size=int(self.batch_size_var.get()),
+                sh_degree=int(self.sh_degree_var.get()),
+                sh_degree_interval=int(self.sh_interval_var.get()),
+                init_scale=float(self.init_scale_var.get()),
+                min_scale=float(self.min_scale_var.get()),
+                max_scale=float(self.max_scale_var.get()),
+                opacity_bias=float(self.opacity_bias_var.get()),
+                random_background=bool(self.random_background_var.get()),
+                means_lr=float(self.means_lr_var.get()),
+                scales_lr=float(self.scales_lr_var.get()),
+                opacities_lr=float(self.opacities_lr_var.get()),
+                sh_lr=float(self.sh_lr_var.get()),
+                lr_final_scale=float(self.lr_final_scale_var.get()),
+                densify_start=int(self.densify_start_var.get()),
+                densify_interval=int(self.densify_interval_var.get()),
+                densify_opacity_threshold=float(self.densify_opacity_var.get()),
+                densify_scale_threshold=float(self.densify_scale_var.get()),
+                prune_opacity_threshold=float(self.prune_opacity_var.get()),
+                prune_scale_threshold=float(self.prune_scale_var.get()),
+                densify_max_points=int(self.densify_max_points_var.get()),
+                preview_interval_seconds=float(self.preview_interval_var.get()),
+                preview_min_iters=int(self.preview_min_iters_var.get()),
+                max_preview_points=int(self.preview_max_points_var.get()),
+            )
+        if method == "depth_anything_3":
+            pretrained_id = self.da3_pretrained_id_var.get().strip()
+            if not pretrained_id:
+                raise ValueError("Depth Anything 3 requires a pretrained model id or local directory.")
+            return {
+                "pretrained_id": pretrained_id,
+                "device": self.device_var.get().strip() or "cuda",
+                "use_input_resolution": bool(self.da3_use_input_res_var.get()),
+                "process_res": int(self.da3_process_res_var.get()),
+                "process_res_method": self.da3_process_res_method_var.get().strip() or "upper_bound_resize",
+                "align_to_input_ext_scale": bool(self.da3_align_scale_var.get()),
+                "infer_gs": bool(self.da3_infer_gs_var.get()),
+                "use_ray_pose": bool(self.da3_use_ray_pose_var.get()),
+                "ref_view_strategy": self.da3_ref_view_var.get().strip() or "saddle_balanced",
+                "gs_views_interval": int(self.da3_gs_views_interval_var.get()),
+                "view_stride": int(self.da3_view_stride_var.get()),
+                "max_views": int(self.da3_max_views_var.get()),
+            }
+        raise ValueError(f"Unsupported training method: {method}")
 
     def _has_sfm_outputs(self, scene_id: str) -> bool:
         paths = self.app_state.scene_manager.get(scene_id).paths

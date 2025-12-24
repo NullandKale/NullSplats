@@ -12,8 +12,10 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import atexit
 import shutil
 import subprocess
+import threading
 import time
 from typing import Iterable, List
 
@@ -24,6 +26,24 @@ from nullsplats.util.tooling_paths import default_colmap_path
 
 
 logger = get_logger("sfm_pipeline")
+
+_ACTIVE_SFM_PROCESSES: set[subprocess.Popen] = set()
+_PROCESS_LOCK = threading.Lock()
+
+
+def _cleanup_active_processes() -> None:
+    with _PROCESS_LOCK:
+        procs = list(_ACTIVE_SFM_PROCESSES)
+    for proc in procs:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                continue
+            proc.wait()
+
+
+atexit.register(_cleanup_active_processes)
 
 
 @dataclass(frozen=True)
@@ -279,20 +299,27 @@ def _stream_command(cmd: List[str], log_file, log_path: Path, label: str) -> Non
         log_file.write(f"[cwd] {run_dir}\n")
     log_file.flush()
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=run_dir)
-    if process.stdout is None:
-        raise RuntimeError(f"Failed to start process for: {joined}")
-    for line in process.stdout:
-        log_file.write(line)
+    with _PROCESS_LOCK:
+        _ACTIVE_SFM_PROCESSES.add(process)
+    try:
+        if process.stdout is None:
+            raise RuntimeError(f"Failed to start process for: {joined}")
+        for line in process.stdout:
+            log_file.write(line)
+            log_file.flush()
+            logger.info("%s: %s", label, line.rstrip())
+        process.wait()
+        if process.returncode != 0:
+            hint = _describe_failure(process.returncode)
+            logger.error("%s failed code=%d%s; see %s", label, process.returncode, hint, log_path)
+            raise RuntimeError(f"{label} failed with exit code {process.returncode}{hint}. See log: {log_path}")
+        logger.info("%s completed code=%d", label, process.returncode)
+        log_file.write(f"[completed] {label}\n")
         log_file.flush()
-        logger.info("%s: %s", label, line.rstrip())
-    process.wait()
-    if process.returncode != 0:
-        hint = _describe_failure(process.returncode)
-        logger.error("%s failed code=%d%s; see %s", label, process.returncode, hint, log_path)
-        raise RuntimeError(f"{label} failed with exit code {process.returncode}{hint}. See log: {log_path}")
-    logger.info("%s completed code=%d", label, process.returncode)
-    log_file.write(f"[completed] {label}\n")
-    log_file.flush()
+    finally:
+        with _PROCESS_LOCK:
+            _ACTIVE_SFM_PROCESSES.discard(process)
+    return
 
 
 def _describe_failure(code: int) -> str:

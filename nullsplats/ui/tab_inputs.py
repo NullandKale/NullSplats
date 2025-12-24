@@ -530,6 +530,10 @@ class InputsTab(InputsTabScenesMixin, InputsTabGridMixin, InputsTabWizardMixin):
             self._autosave_job = None
         if not self._dirty_selection:
             return
+        if self._extracting:
+            self._set_status("Waiting for extraction to finish before saving selection...")
+            self._schedule_autosave("waiting_for_extraction", delay_ms=500)
+            return
         scene_id = self._require_scene()
         if scene_id is None:
             return

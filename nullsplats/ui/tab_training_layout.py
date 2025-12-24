@@ -80,6 +80,29 @@ class TrainingTabLayoutMixin:
             anchor="w", padx=10, pady=(10, 6)
         )
 
+        method_card = ttk.LabelFrame(left_col, text="Training method")
+        method_card.pack(fill="x", padx=10, pady=(0, 6))
+        method_row = ttk.Frame(method_card)
+        method_row.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Label(method_row, text="Method:").pack(side="left")
+        method_combo = ttk.Combobox(
+            method_row,
+            textvariable=self.training_method_var,
+            values=sorted(self._trainers.keys()),
+            state="readonly",
+            width=18,
+        )
+        method_combo.pack(side="left", padx=(4, 12))
+        method_combo.bind("<<ComboboxSelected>>", lambda _: self._apply_trainer_capabilities())
+        self._register_control(method_combo)
+        ttk.Label(method_row, text="Device:").pack(side="left")
+        device_entry = ttk.Entry(method_row, textvariable=self.device_var, width=12)
+        device_entry.pack(side="left", padx=(4, 0))
+        self._register_control(device_entry)
+        ttk.Label(method_card, textvariable=self.method_hint_var, foreground="#666").pack(
+            anchor="w", padx=6, pady=(0, 6)
+        )
+
         scene_card = ttk.LabelFrame(left_col, text="Scene context")
         scene_card.pack(fill="x", padx=10, pady=(0, 6))
         self.scene_label = ttk.Label(scene_card, text=self._scene_text(), anchor="w", justify="left", font=("Segoe UI", 10, "bold"))
@@ -133,8 +156,13 @@ class TrainingTabLayoutMixin:
         btn_warm.pack(side="right")
         self._register_control(btn_warm)
 
-        primary_cfg = ttk.LabelFrame(left_col, text="Primary settings")
-        primary_cfg.pack(fill="x", padx=10, pady=(0, 6))
+        self.gsplat_settings_frame = ttk.Frame(left_col)
+        self.gsplat_settings_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self.da3_settings_frame = ttk.Frame(left_col)
+        self.da3_settings_frame.pack(fill="x", padx=10, pady=(0, 6))
+
+        primary_cfg = ttk.LabelFrame(self.gsplat_settings_frame, text="Gsplat settings")
+        primary_cfg.pack(fill="x", padx=0, pady=(0, 6))
         preset_row = ttk.Frame(primary_cfg)
         preset_row.pack(fill="x", padx=6, pady=(6, 4))
         ttk.Label(preset_row, text="Preset:").pack(side="left")
@@ -154,8 +182,6 @@ class TrainingTabLayoutMixin:
 
         core_row1 = ttk.Frame(primary_cfg)
         core_row1.pack(fill="x", padx=6, pady=(0, 4))
-        ttk.Label(core_row1, text="Device:").pack(side="left")
-        ttk.Entry(core_row1, textvariable=self.device_var, width=14).pack(side="left", padx=(4, 12))
         ttk.Label(core_row1, text="Iterations:").pack(side="left")
         ttk.Spinbox(core_row1, from_=1, to=1_000_000, textvariable=self.iterations_var, width=10).pack(side="left", padx=(4, 12))
         ttk.Label(core_row1, text="Snapshot interval:").pack(side="left")
@@ -168,8 +194,100 @@ class TrainingTabLayoutMixin:
         ttk.Label(core_row2, text="Export format:").pack(side="left")
         ttk.Combobox(core_row2, textvariable=self.export_format_var, values=("ply", "splat"), width=8).pack(side="left", padx=(4, 12))
 
+        da3_body = ttk.LabelFrame(self.da3_settings_frame, text="Depth Anything 3 settings")
+        da3_body.pack(fill="x", padx=0, pady=(0, 6))
+        da3_row1 = ttk.Frame(da3_body)
+        da3_row1.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Label(da3_row1, text="Model id/path:").pack(side="left")
+        da3_model_entry = ttk.Entry(da3_row1, textvariable=self.da3_pretrained_id_var, width=32)
+        da3_model_entry.pack(
+            side="left", padx=(4, 0), fill="x", expand=True
+        )
+        self._register_control(da3_model_entry)
+
+        da3_row2 = ttk.Frame(da3_body)
+        da3_row2.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(da3_row2, text="Preset:").pack(side="left")
+        da3_preset_combo = ttk.Combobox(
+            da3_row2,
+            textvariable=self.training_preset_var,
+            values=["low", "medium", "high"],
+            state="readonly",
+            width=10,
+        )
+        da3_preset_combo.pack(side="left", padx=(4, 12))
+        da3_preset_combo.bind("<<ComboboxSelected>>", lambda _: self._apply_training_preset())
+        self._register_control(da3_preset_combo)
+        ttk.Label(da3_row2, text="Ref view:").pack(side="left")
+        da3_ref_combo = ttk.Combobox(
+            da3_row2,
+            textvariable=self.da3_ref_view_var,
+            values=("saddle_balanced", "saddle_sim_range", "first", "middle"),
+            width=16,
+            state="readonly",
+        )
+        da3_ref_combo.pack(side="left", padx=(4, 12))
+        self._register_control(da3_ref_combo)
+        da3_ray_toggle = ttk.Checkbutton(da3_row2, text="Use ray pose", variable=self.da3_use_ray_pose_var)
+        da3_ray_toggle.pack(side="left")
+        self._register_control(da3_ray_toggle)
+
+        da3_row3 = ttk.Frame(da3_body)
+        da3_row3.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(da3_row3, text="Process res:").pack(side="left")
+        da3_res_spin = ttk.Spinbox(da3_row3, from_=128, to=2048, textvariable=self.da3_process_res_var, width=8)
+        da3_res_spin.pack(side="left", padx=(4, 12))
+        self._register_control(da3_res_spin)
+        ttk.Label(da3_row3, text="Resize method:").pack(side="left")
+        da3_resize_combo = ttk.Combobox(
+            da3_row3,
+            textvariable=self.da3_process_res_method_var,
+            values=("upper_bound_resize", "lower_bound_resize"),
+            width=18,
+            state="readonly",
+        )
+        da3_resize_combo.pack(side="left", padx=(4, 12))
+        self._register_control(da3_resize_combo)
+
+        da3_row4 = ttk.Frame(da3_body)
+        da3_row4.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(da3_row4, text="View stride:").pack(side="left")
+        da3_stride_spin = ttk.Spinbox(
+            da3_row4, from_=1, to=100, textvariable=self.da3_view_stride_var, width=6
+        )
+        da3_stride_spin.pack(side="left", padx=(4, 12))
+        self._register_control(da3_stride_spin)
+        ttk.Label(da3_row4, text="Max views:").pack(side="left")
+        da3_max_views_spin = ttk.Spinbox(
+            da3_row4, from_=0, to=10_000, textvariable=self.da3_max_views_var, width=8
+        )
+        da3_max_views_spin.pack(side="left", padx=(4, 12))
+        self._register_control(da3_max_views_spin)
+        ttk.Label(da3_row4, text="GS views interval:").pack(side="left")
+        da3_interval_spin = ttk.Spinbox(
+            da3_row4, from_=1, to=100, textvariable=self.da3_gs_views_interval_var, width=6
+        )
+        da3_interval_spin.pack(side="left", padx=(4, 12))
+        self._register_control(da3_interval_spin)
+
+        da3_row5 = ttk.Frame(da3_body)
+        da3_row5.pack(fill="x", padx=6, pady=(0, 4))
+        da3_align_toggle = ttk.Checkbutton(
+            da3_row5, text="Align to input scale", variable=self.da3_align_scale_var
+        )
+        da3_align_toggle.pack(side="left", padx=(0, 12))
+        self._register_control(da3_align_toggle)
+        da3_infer_toggle = ttk.Checkbutton(da3_row5, text="Infer GS", variable=self.da3_infer_gs_var)
+        da3_infer_toggle.pack(side="left", padx=(0, 12))
+        self._register_control(da3_infer_toggle)
+        da3_input_toggle = ttk.Checkbutton(
+            da3_row5, text="Use input resolution", variable=self.da3_use_input_res_var
+        )
+        da3_input_toggle.pack(side="left")
+        self._register_control(da3_input_toggle)
+
         # Advanced controls tucked away
-        training_body = self._collapsible_section(left_col, "Training config (advanced)", start_hidden=True)
+        training_body = self._collapsible_section(self.gsplat_settings_frame, "Training config (advanced)", start_hidden=True)
         path_row = ttk.Frame(training_body)
         path_row.pack(fill="x", padx=6, pady=(6, 4))
         ttk.Label(path_row, text="CUDA toolkit path:").pack(side="left")
@@ -208,7 +326,7 @@ class TrainingTabLayoutMixin:
             side="left", padx=(4, 0)
         )
 
-        opt_body = self._collapsible_section(left_col, "Optimization", start_hidden=True)
+        opt_body = self._collapsible_section(self.gsplat_settings_frame, "Optimization", start_hidden=True)
         opt_row1 = ttk.Frame(opt_body)
         opt_row1.pack(fill="x", padx=6, pady=(6, 4))
         ttk.Label(opt_row1, text="Init scale:").pack(side="left")
@@ -256,7 +374,7 @@ class TrainingTabLayoutMixin:
             width=8,
         ).pack(side="left", padx=(4, 0))
 
-        densify_body = self._collapsible_section(left_col, "Densify / prune", start_hidden=True)
+        densify_body = self._collapsible_section(self.gsplat_settings_frame, "Densify / prune", start_hidden=True)
         densify_row1 = ttk.Frame(densify_body)
         densify_row1.pack(fill="x", padx=6, pady=(6, 4))
         ttk.Label(densify_row1, text="Start / interval (iters):").pack(side="left")

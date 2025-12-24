@@ -257,6 +257,7 @@ class ThumbnailCache:
         self.max_workers = max(1, max_workers or (os.cpu_count() or 4))
         self._thumbs: dict[str, dict[str, bytes]] = {}
         self._lock = threading.Lock()
+        self._db_lock = threading.Lock()
         self._warmup_thread: Optional[threading.Thread] = None
         self._db_path = self.cache_root / "thumbnails.db"
         self._load_db()
@@ -338,16 +339,19 @@ class ThumbnailCache:
         try:
             import sqlite3
 
-            conn = sqlite3.connect(self._db_path)
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS thumbs (scene TEXT, name TEXT, data BLOB, PRIMARY KEY(scene, name))"
-            )
-            cursor = conn.execute("SELECT scene, name, data FROM thumbs")
-            with self._lock:
-                for scene, name, data in cursor:
-                    self._thumbs.setdefault(scene, {})[name] = data
-            conn.close()
-            _LOGGER.info("Loaded thumbnail DB %s entries=%d", self._db_path, sum(len(v) for v in self._thumbs.values()))
+            with self._db_lock:
+                conn = sqlite3.connect(self._db_path)
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS thumbs (scene TEXT, name TEXT, data BLOB, PRIMARY KEY(scene, name))"
+                )
+                cursor = conn.execute("SELECT scene, name, data FROM thumbs")
+                with self._lock:
+                    for scene, name, data in cursor:
+                        self._thumbs.setdefault(scene, {})[name] = data
+                conn.close()
+                _LOGGER.info(
+                    "Loaded thumbnail DB %s entries=%d", self._db_path, sum(len(v) for v in self._thumbs.values())
+                )
         except Exception:  # noqa: BLE001
             _LOGGER.debug("Failed to load thumbnail DB", exc_info=True)
 
@@ -355,20 +359,21 @@ class ThumbnailCache:
         try:
             import sqlite3
 
-            conn = sqlite3.connect(self._db_path)
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS thumbs (scene TEXT, name TEXT, data BLOB, PRIMARY KEY(scene, name))"
-            )
-            with self._lock:
-                rows = [
-                    (scene, name, data) for scene, thumbs in self._thumbs.items() for name, data in thumbs.items()
-                ]
-            conn.executemany(
-                "INSERT OR REPLACE INTO thumbs(scene, name, data) VALUES (?, ?, ?)",
-                rows,
-            )
-            conn.commit()
-            conn.close()
+            with self._db_lock:
+                conn = sqlite3.connect(self._db_path)
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS thumbs (scene TEXT, name TEXT, data BLOB, PRIMARY KEY(scene, name))"
+                )
+                with self._lock:
+                    rows = [
+                        (scene, name, data) for scene, thumbs in self._thumbs.items() for name, data in thumbs.items()
+                    ]
+                conn.executemany(
+                    "INSERT OR REPLACE INTO thumbs(scene, name, data) VALUES (?, ?, ?)",
+                    rows,
+                )
+                conn.commit()
+                conn.close()
         except Exception:  # noqa: BLE001
             _LOGGER.debug("Failed to save thumbnail DB", exc_info=True)
 

@@ -9,25 +9,26 @@ import numpy as np
 from PIL import Image
 import torch
 
+from nullsplats.backend.colmap_io import find_text_model, parse_cameras, parse_images
 from nullsplats.backend.io_cache import ScenePaths
 from nullsplats.backend.splat_train_config import FrameRecord
 
 
 def load_colmap_frames(paths: ScenePaths, device: torch.device, *, image_downscale: int) -> List[FrameRecord]:
-    cameras_txt, images_txt = _find_text_model(paths)
-    cameras = _parse_cameras(cameras_txt)
-    images = _parse_images(images_txt)
+    cameras_txt, images_txt = find_text_model(paths)
+    cameras = parse_cameras(cameras_txt)
+    images = parse_images(images_txt)
     records: List[FrameRecord] = []
     frames_dir = paths.frames_selected_dir
     for idx, image_entry in enumerate(images):
-        camera = cameras.get(image_entry["camera_id"])
+        camera = cameras.get(image_entry.camera_id)
         if camera is None:
-            raise RuntimeError(f"Camera id {image_entry['camera_id']} missing in cameras.txt")
-        image_path = frames_dir / image_entry["name"]
+            raise RuntimeError(f"Camera id {image_entry.camera_id} missing in cameras.txt")
+        image_path = frames_dir / image_entry.name
         if not image_path.exists():
-            image_path = frames_dir / Path(image_entry["name"]).name
+            image_path = frames_dir / Path(image_entry.name).name
         if not image_path.exists():
-            raise FileNotFoundError(f"Image {image_entry['name']} not found under {frames_dir}")
+            raise FileNotFoundError(f"Image {image_entry.name} not found under {frames_dir}")
         width = camera["width"]
         height = camera["height"]
         fx, fy, cx, cy = camera["params"]
@@ -39,12 +40,12 @@ def load_colmap_frames(paths: ScenePaths, device: torch.device, *, image_downsca
             cx = cx / image_downscale
             cy = cy / image_downscale
         K = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
-        camtoworld = _cam_to_world_matrix(image_entry["qvec"], image_entry["tvec"], device=device)
+        camtoworld = _cam_to_world_matrix(tuple(image_entry.qvec), tuple(image_entry.tvec), device=device)
         image_tensor = _load_image_tensor(image_path, height, width)
         records.append(
             FrameRecord(
                 index=idx,
-                name=image_entry["name"],
+                name=image_entry.name,
                 image_path=image_path,
                 camtoworld=camtoworld,
                 K=K,
@@ -75,72 +76,6 @@ def load_sparse_points(paths: ScenePaths) -> Tuple[torch.Tensor, torch.Tensor]:
     return means, colors
 
 
-def _find_text_model(paths: ScenePaths) -> Tuple[Path, Path]:
-    candidates = [
-        (paths.sfm_dir / "sparse" / "text" / "cameras.txt", paths.sfm_dir / "sparse" / "text" / "images.txt"),
-        (paths.sfm_dir / "sparse" / "0" / "cameras.txt", paths.sfm_dir / "sparse" / "0" / "images.txt"),
-        (paths.sfm_dir / "sparse" / "cameras.txt", paths.sfm_dir / "sparse" / "images.txt"),
-    ]
-    for cams, imgs in candidates:
-        if cams.exists() and imgs.exists():
-            return cams, imgs
-    raise FileNotFoundError(
-        f"cameras.txt/images.txt not found under {paths.sfm_dir}. Re-run COLMAP so text models are exported."
-    )
-
-
-def _parse_cameras(path: Path) -> dict[int, dict]:
-    cameras: dict[int, dict] = {}
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line or line.startswith("#"):
-                continue
-            parts = line.strip().split()
-            if len(parts) < 8:
-                continue
-            cam_id = int(parts[0])
-            model = parts[1]
-            width = int(parts[2])
-            height = int(parts[3])
-            params = list(map(float, parts[4:]))
-            if model not in {"PINHOLE", "SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"}:
-                raise ValueError(f"Unsupported COLMAP camera model: {model}")
-            if model == "PINHOLE":
-                fx, fy, cx, cy = params[:4]
-            else:
-                fx = fy = params[0]
-                cx = params[1]
-                cy = params[2] if len(params) > 2 else params[1]
-            cameras[cam_id] = {"model": model, "width": width, "height": height, "params": (fx, fy, cx, cy)}
-    return cameras
-
-
-def _parse_images(path: Path) -> List[dict]:
-    entries: List[dict] = []
-    with path.open("r", encoding="utf-8") as handle:
-        lines = iter(handle.readlines())
-        for line in lines:
-            if not line or line.startswith("#"):
-                continue
-            parts = line.strip().split()
-            if len(parts) < 10:
-                continue
-            image_id = int(parts[0])
-            qw, qx, qy, qz = map(float, parts[1:5])
-            tx, ty, tz = map(float, parts[5:8])
-            camera_id = int(parts[8])
-            name = parts[9]
-            entries.append(
-                {
-                    "image_id": image_id,
-                    "qvec": (qw, qx, qy, qz),
-                    "tvec": (tx, ty, tz),
-                    "camera_id": camera_id,
-                    "name": name,
-                }
-            )
-            next(lines, None)  # skip 2D point line
-    return entries
 
 
 def _cam_to_world_matrix(qvec: Tuple[float, float, float, float], tvec: Tuple[float, float, float], device: torch.device) -> torch.Tensor:

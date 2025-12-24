@@ -77,6 +77,7 @@ extraction, COLMAP structure-from-motion, and gsplat training.
 
 #### Training Tab
 - ui/tab_training.py orchestrates training runs, manages logging, and owns preview state.
+- Training method is selectable (gsplat or DA3). Live preview is gsplat-only.
 - ui/tab_training_layout.py builds the UI widgets.
 - ui/tab_training_preview.py handles preview polling + in-memory preview queue.
 - Backend calls:
@@ -105,6 +106,7 @@ extraction, COLMAP structure-from-motion, and gsplat training.
   - backend/splat_train_io.py (COLMAP text parsing + frame loading)
   - backend/splat_train_ops.py (CUDA config, optimizers, export helpers)
   - backend/gs_utils.py (camera/appearance optimization utilities)
+- DA3 backend: backend/splat_backends/depth_anything3_trainer.py (Depth Anything 3 inference + gs_ply export)
 
 ### Rendering and Viewer Stack
 - ui/gl_canvas.py is the main preview surface:
@@ -137,6 +139,19 @@ extraction, COLMAP structure-from-motion, and gsplat training.
 - ffmpeg/ffprobe on PATH (for video extraction).
 - COLMAP binaries (CUDA build recommended) under tools/colmap or user-provided path.
 - Optional: GLOMAP binaries under tools/glomap (future use).
+- Optional: Depth Anything 3 backend (pip install from GitHub; no submodule).
+
+## Depth Anything 3 (DA3) backend
+
+DA3 uses the official Depth Anything 3 API and emits `.ply` splats into the cache.
+It requires installing the project via pip from GitHub:
+
+```
+pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3
+```
+
+DA3 settings live in the Training tab (process resolution, view selection, and COLMAP-based view scoring).
+If COLMAP confidence is missing, DA3 falls back to evenly spaced views.
 
 ## Install for development
 

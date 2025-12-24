@@ -145,7 +145,10 @@ class ExportsTab:
                 self.frame.after(150, lambda path=pending: self._start_preview(path))
         else:
             self.logger.debug("Exports tab hidden; stopping renderer")
-            self.viewer.stop_rendering()
+            try:
+                self.viewer.stop_rendering()
+            except Exception:  # noqa: BLE001
+                self.logger.exception("Failed to stop exports viewer")
 
     def _refresh_scenes(self) -> None:
         scenes = [str(status.scene_id) for status in self.app_state.scene_manager.list_scenes()]

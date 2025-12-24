@@ -91,9 +91,12 @@ class SplatRenderer:
         means = _stack_props(raw, ("x", "y", "z"))
         dc = _stack_props(raw, ("f_dc_0", "f_dc_1", "f_dc_2")).reshape(-1, 1, 3)
         rest_props = _collect_rest_props(raw)
-        if len(rest_props) % 3 != 0:
-            raise ValueError("f_rest properties must be divisible by 3 for SH coefficients.")
-        sh_rest = _stack_props(raw, rest_props).reshape(-1, max(1, len(rest_props) // 3), 3)
+        if rest_props:
+            if len(rest_props) % 3 != 0:
+                raise ValueError("f_rest properties must be divisible by 3 for SH coefficients.")
+            sh_rest = _stack_props(raw, rest_props).reshape(-1, len(rest_props) // 3, 3)
+        else:
+            sh_rest = torch.zeros((means.shape[0], 0, 3), dtype=torch.float32)
         sh_channels = dc.shape[1] + sh_rest.shape[1]
         sh_degree = max(0, int(round(math.sqrt(sh_channels) - 1)))
         logger.info(
@@ -829,8 +832,10 @@ def _load_ply_properties(path: Path) -> np.ndarray:
         data = handle.read()
 
     fmt = next((l for l in header_lines if l.startswith("format ")), "")
-    if "binary_little_endian" not in fmt:
-        raise ValueError("Only binary_little_endian PLY is supported for preview.")
+    ascii_format = "ascii" in fmt
+    binary_format = "binary_little_endian" in fmt
+    if not (ascii_format or binary_format):
+        raise ValueError(f"Unsupported PLY format: {fmt or '<missing>'}")
 
     vertex_count = 0
     props: List[Tuple[str, str]] = []
@@ -849,9 +854,31 @@ def _load_ply_properties(path: Path) -> np.ndarray:
     if vertex_count == 0:
         raise ValueError("No vertices found in PLY header.")
     dtype = np.dtype([(name, typ) for name, typ in props])
-    arr = np.frombuffer(data, dtype=dtype, count=vertex_count)
-    if arr.size != vertex_count:
-        raise ValueError(f"Expected {vertex_count} vertices, parsed {arr.size}.")
+    if ascii_format:
+        text = data.decode("ascii", errors="ignore").strip().splitlines()
+        rows: List[tuple] = []
+        for line in text:
+            if not line.strip():
+                continue
+            parts = line.strip().split()
+            if len(parts) < len(props):
+                continue
+            parsed = []
+            for value, (_, typ) in zip(parts, props):
+                if np.issubdtype(np.dtype(typ), np.floating):
+                    parsed.append(float(value))
+                else:
+                    parsed.append(int(float(value)))
+            rows.append(tuple(parsed))
+            if len(rows) >= vertex_count:
+                break
+        arr = np.array(rows, dtype=dtype)
+        if arr.size != vertex_count:
+            raise ValueError(f"Expected {vertex_count} vertices, parsed {arr.size}.")
+    else:
+        arr = np.frombuffer(data, dtype=dtype, count=vertex_count)
+        if arr.size != vertex_count:
+            raise ValueError(f"Expected {vertex_count} vertices, parsed {arr.size}.")
     elapsed = time.perf_counter() - start_read
     logger.info(
         "PLY parse done path=%s verts=%d props=%d elapsed=%.3fs dtype=%s",
