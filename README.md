@@ -23,34 +23,18 @@ Here are some sample splats trained using this program.
 - [5 views — Depth Anything 3, 720p](https://superspl.at/editor?load=https%3A%2F%2Fraw.githubusercontent.com%2FNullandKale%2FNullSplats%2Fmaster%2Fassets%2Fsplat_DA3_5views_720p.splat)
 - [1 view — SHARP, 720p](https://superspl.at/editor?load=https%3A%2F%2Fraw.githubusercontent.com%2FNullandKale%2FNullSplats%2Fmaster%2Fassets%2Fsplat_SHARP_1views_720p.splat)
 
-## Video Examples
-Gsplat 50-view
+<details>
+<summary>Video Examples (click to expand)</summary>
 
-https://github.com/user-attachments/assets/0a5431de-d146-4192-8305-6ec645161ba1
+- Gsplat 50-view: https://github.com/user-attachments/assets/0a5431de-d146-4192-8305-6ec645161ba1
+- Gsplat closeup: https://github.com/user-attachments/assets/01245b1e-0098-4ebb-ad6c-00e220ba4e85
+- DA3 5-view: https://github.com/user-attachments/assets/c5cf7697-eb91-4ee9-9f46-6190622df765
+- DA3 closeup: https://github.com/user-attachments/assets/b87fa2f9-23c9-4a3b-bba7-82734a069edf
+- SHARP 1-view: https://github.com/user-attachments/assets/127c5651-a7da-471f-8c65-5c65db2283b2
+- SHARP closeup: https://github.com/user-attachments/assets/c5599843-46d5-4d2f-ab3d-5881534f3c3e
+- Side-by-side comparison: https://github.com/user-attachments/assets/00e8449d-0f26-4258-8469-4dc7424652ca
 
-Gsplat closeup
-
-https://github.com/user-attachments/assets/01245b1e-0098-4ebb-ad6c-00e220ba4e85
-
-DA3 5-view
-
-https://github.com/user-attachments/assets/c5cf7697-eb91-4ee9-9f46-6190622df765
-
-DA3 closeup
-
-https://github.com/user-attachments/assets/b87fa2f9-23c9-4a3b-bba7-82734a069edf
-
-SHARP 1-view
-
-https://github.com/user-attachments/assets/127c5651-a7da-471f-8c65-5c65db2283b2
-
-SHARP closeup
-
-https://github.com/user-attachments/assets/c5599843-46d5-4d2f-ab3d-5881534f3c3e
-
-Side-by-side comparison
-
-https://github.com/user-attachments/assets/00e8449d-0f26-4258-8469-4dc7424652ca
+</details>
 
 On my RTX pro 6000 Blackwell the gsplat trained in around 5 minutes including colmap time. Depth Anything 3 took around 3-4 minutes but used a significant 16GB of vram. SHARP produced a splat in around 2.5 minutes.
 
