@@ -30,3 +30,4 @@ tools/colmap/
 tools/gsplat_examples/
 exports/
 log/test.log
+torch_extensions/*

@@ -1,0 +1,6 @@
+[submodule "tools/depth-anything-3"]
+	path = tools/depth-anything-3
+	url = https://github.com/ByteDance-Seed/Depth-Anything-3
+[submodule "tools/sharp"]
+	path = tools/sharp
+	url = https://github.com/apple/ml-sharp

@@ -1,5 +1,5 @@
 torch
-gsplat
+gsplat==1.5.3
 numpy
 Pillow
 packaging

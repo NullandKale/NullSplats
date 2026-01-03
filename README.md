@@ -186,54 +186,28 @@ extraction, COLMAP structure-from-motion, and gsplat training.
 - GPU with a CUDA-capable driver; PyTorch CUDA build installed.
 - ffmpeg/ffprobe on PATH (for video extraction).
 - COLMAP binaries (CUDA build recommended) under tools/colmap or user-provided path.
-- Optional: GLOMAP binaries under tools/glomap (future use).
-- Optional: Depth Anything 3 backend (pip install from GitHub; no submodule).
-- Optional: SHARP backend (tools/sharp is included; install editable deps).
-
-## Depth Anything 3 (DA3) backend
-
-DA3 uses the official Depth Anything 3 API and emits `.ply` splats into the cache.
-It requires installing the project via pip from GitHub:
-
-```
-pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3
-```
-
-DA3 settings live in the Training tab (process resolution, view selection, and COLMAP-based view scoring).
-If COLMAP confidence is missing, DA3 falls back to evenly spaced views.
-
-## SHARP backend
-
-SHARP runs on single images and can optionally use COLMAP intrinsics for multi-view runs.
-The repo includes the SHARP source under tools/sharp; install it in editable mode:
-
-```
-pip install -e tools/sharp
-```
+- Depth Anything 3 backend (submodule under tools/depth-anything-3).
+- SHARP backend (submodule under tools/sharp).
 
 ## Install for development
 
-From repo root:
+Prereqs:
+
+- Windows 10/11.
+- Python 3.10+ on PATH.
+- Visual Studio 2022 or newer (Desktop development with C++).
+- CUDA Toolkit 12.8: https://developer.nvidia.com/cuda-12-8-0-download-archive?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_network
+- COLMAP under `tools/colmap` (or set in the UI).
+- ffmpeg/ffprobe on PATH.
+
+From repo root (recommended):
 
 ```
-python -m venv .venv
-.venv\Scripts\activate.bat
-pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File tools\setup.ps1
 ```
 
-If you need to bootstrap CUDA-friendly PyTorch/gsplat, run tools\setup_cuda_venv.bat (optional helper if present).
-
-For DA3 support:
-
-```
-pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3
-```
-
-For SHARP support (if you skipped it in requirements):
-
-```
-pip install -e tools/sharp
-```
+The setup script initializes the VS build environment, enforces CUDA 12.8, updates submodules,
+creates the venv, installs dependencies, and builds gsplat from source.
 
 ## Running the app
 
