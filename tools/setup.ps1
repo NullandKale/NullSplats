@@ -24,7 +24,13 @@ if ($unknownArgs.Count -gt 0) {
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $venvPath = Join-Path $repoRoot ".venv"
 $pipIndex = "https://download.pytorch.org/whl/cu128"
+$programFiles64 = $env:ProgramW6432
+if (-not $programFiles64) {
+  $programFiles64 = $env:ProgramFiles
+}
 $defaultCudaHome = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+$defaultCudaHome64 = Join-Path $programFiles64 "NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+$defaultCudaHomeX86 = Join-Path ${env:ProgramFiles(x86)} "NVIDIA GPU Computing Toolkit\CUDA\v12.8"
 
 Write-Host "Repo root: $repoRoot"
 Write-Host "Venv:      $venvPath"
@@ -135,9 +141,10 @@ function Resolve-CudaHome {
 
 function List-CudaInstallations {
   $roots = @(
-    "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA",
-    "C:\Program Files (x86)\NVIDIA GPU Computing Toolkit\CUDA"
-  ) | Where-Object { Test-Path $_ }
+    (Join-Path $programFiles64 "NVIDIA GPU Computing Toolkit\CUDA"),
+    (Join-Path $env:ProgramFiles "NVIDIA GPU Computing Toolkit\CUDA"),
+    (Join-Path ${env:ProgramFiles(x86)} "NVIDIA GPU Computing Toolkit\CUDA")
+  ) | Where-Object { $_ -and (Test-Path $_) }
 
   $found = @()
   foreach ($root in $roots) {
@@ -160,12 +167,22 @@ function List-CudaInstallations {
 
 function Ensure-Cuda128 {
   $candidates = List-CudaInstallations
-  $defaultFound = $candidates | Where-Object { $_ -ieq $defaultCudaHome }
+  $defaultFound = @(
+    $defaultCudaHome64,
+    $defaultCudaHome,
+    $defaultCudaHomeX86
+  ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 
   if ($defaultFound) {
-    $cudaHome = $defaultCudaHome
+    $cudaHome = $defaultFound
   } else {
     $cudaHome = Resolve-CudaHome
+    if (-not $cudaHome -and $candidates) {
+      $cuda128 = $candidates | Where-Object { $_ -match "v12\.8$" } | Select-Object -First 1
+      if ($cuda128) {
+        $cudaHome = $cuda128
+      }
+    }
   }
   if (-not $cudaHome) {
     Write-Host "CUDA 12.8 not found. Install it at $defaultCudaHome or set CUDA_HOME." -ForegroundColor Yellow
@@ -259,13 +276,11 @@ if (-not (Test-Path $venvPath)) {
   & pip install -r "$repoRoot\requirements.txt" -c $constraints --extra-index-url $pipIndex --no-binary=gsplat --no-build-isolation
   Remove-Item $constraints -ErrorAction SilentlyContinue
 
-  if ($WithDA3) {
-    Write-Host "Installing Depth Anything 3..."
-    if (Test-Path (Join-Path $repoRoot "tools\depth-anything-3")) {
-      & pip install -e "$repoRoot\tools\depth-anything-3"
-    } else {
-      & pip install "git+https://github.com/ByteDance-Seed/Depth-Anything-3"
-    }
+  Write-Host "Installing Depth Anything 3..."
+  if (Test-Path (Join-Path $repoRoot "tools\depth-anything-3")) {
+    & pip install -e "$repoRoot\tools\depth-anything-3"
+  } else {
+    & pip install "git+https://github.com/ByteDance-Seed/Depth-Anything-3"
   }
 
   Write-Host "Setup complete. You can now run: python main.py"
@@ -279,6 +294,13 @@ if (-not (Test-Path $venvPath)) {
   Ensure-Cuda128
   Write-Host "Checking COLMAP..."
   Ensure-Colmap | Out-Null
+
+  Write-Host "Installing Depth Anything 3..."
+  if (Test-Path (Join-Path $repoRoot "tools\depth-anything-3")) {
+    & pip install -e "$repoRoot\tools\depth-anything-3"
+  } else {
+    & pip install "git+https://github.com/ByteDance-Seed/Depth-Anything-3"
+  }
 
   Write-Host "Venv activated. You can now run: python main.py"
 }
