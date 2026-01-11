@@ -1,46 +1,39 @@
-"""Exports tab with checkpoint listing, preview, and turntable rendering."""
+"""Standalone viewer app for cached splat checkpoints."""
 
 from __future__ import annotations
 
-import math
 import os
-import shutil
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import ttk
 from typing import List, Optional
-import logging
-
-import imageio
-import numpy as np
 
 from nullsplats.app_state import AppState
 from nullsplats.ui.advanced_render_controls import AdvancedRenderSettingsPanel
 from nullsplats.ui.colmap_camera_panel import ColmapCameraPanel
-from nullsplats.ui.gl_canvas import CameraView, GLCanvas
+from nullsplats.ui.gl_canvas import GLCanvas
 from nullsplats.ui.render_controls import RenderSettingsPanel
 from nullsplats.optional_plugins import looking_glass_available
-from nullsplats.backend.io_cache import ensure_scene_dirs
+from nullsplats.util.config import AppConfig
 from nullsplats.util.logging import get_logger
 from nullsplats.util.threading import run_in_background
 
 
-class ExportsTab:
-    """Manage exported checkpoints and previews for the active scene."""
+class ViewerApp:
+    """Minimal viewer window for cached .splat/.ply outputs."""
 
-    def __init__(self, master: tk.Misc, app_state: AppState) -> None:
-        self.logger = get_logger("ui.exports")
-        self.logger.setLevel(logging.DEBUG)
-        self.app_state = app_state
-        self.frame = ttk.Frame(master)
-        self.scene_var = tk.StringVar(value=str(app_state.current_scene_id or ""))
-        self.export_dir_var = tk.StringVar(value=str(Path("exports")))
-        self.status_var = tk.StringVar(value="Select a scene to list checkpoints.")
-        self.preview_note_var = tk.StringVar(value="Preview idle.")
-        self.checkpoint_paths: List[Path] = []
-        self.viewer: Optional[GLCanvas] = None
-        self._tab_active = False
+    def __init__(self, cache_root: Path) -> None:
+        self.logger = get_logger("ui.viewer")
+        self.cache_root = Path(cache_root)
+        self.app_state = AppState(config=AppConfig(cache_root=self.cache_root))
+        self._current_scene_id: Optional[str] = None
+        self._tab_active = True
         self._pending_preview_path: Optional[Path] = None
+        self._entries: List[Path] = []
+        self.root = tk.Tk()
+        title_root = self.cache_root.resolve()
+        self.root.title(f"NullSplats Viewer - {title_root}")
+        self.root.minsize(1000, 650)
         self.lkg_status_var = tk.StringVar(value="Looking Glass: not available")
         self.lkg_detail_var = tk.StringVar(value="")
         self.lkg_depthiness_var = tk.DoubleVar(value=1.0)
@@ -51,13 +44,12 @@ class ExportsTab:
         self._lkg_status_job: Optional[str] = None
         self._lkg_apply_job: Optional[str] = None
         self._lkg_enabled = looking_glass_available()
+        self._build_ui()
+        self._refresh_list()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._build_contents()
-        self._refresh_scenes()
-        self._load_checkpoints()
-
-    def _build_contents(self) -> None:
-        paned = ttk.Panedwindow(self.frame, orient="horizontal")
+    def _build_ui(self) -> None:
+        paned = ttk.Panedwindow(self.root, orient="horizontal")
         paned.pack(fill="both", expand=True)
 
         right_col = ttk.Frame(paned)
@@ -65,22 +57,15 @@ class ExportsTab:
         paned.add(right_col, weight=3)
         paned.add(left_col, weight=1)
 
-        ttk.Label(left_col, text="Exports and viewer", font=("Segoe UI", 11, "bold")).pack(
+        ttk.Label(left_col, text="Cached outputs", font=("Segoe UI", 11, "bold")).pack(
             anchor="w", padx=10, pady=(10, 4)
         )
 
-        scene_row = ttk.Frame(left_col)
-        scene_row.pack(fill="x", padx=10, pady=(0, 6))
-        ttk.Label(scene_row, text="Scene:").pack(side="left")
-        self.scene_combo = ttk.Combobox(scene_row, textvariable=self.scene_var, state="readonly", width=30)
-        self.scene_combo.pack(side="left", padx=(4, 8))
-        ttk.Button(scene_row, text="Refresh scenes", command=self._refresh_scenes).pack(side="left")
-
-        list_frame = ttk.LabelFrame(left_col, text="Checkpoints (.ply)")
-        list_frame.pack(fill="both", expand=False, padx=10, pady=(0, 8))
+        list_frame = ttk.LabelFrame(left_col, text="Checkpoints (.splat / .ply)")
+        list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
         list_inner = ttk.Frame(list_frame)
         list_inner.pack(fill="both", expand=True, padx=6, pady=6)
-        self.checkpoint_list = tk.Listbox(list_inner, height=8, exportselection=False)
+        self.checkpoint_list = tk.Listbox(list_inner, height=16, exportselection=False)
         self.checkpoint_list.pack(side="left", fill="both", expand=True)
         scroll = ttk.Scrollbar(list_inner, orient="vertical", command=self.checkpoint_list.yview)
         scroll.pack(side="right", fill="y")
@@ -89,29 +74,27 @@ class ExportsTab:
 
         buttons = ttk.Frame(list_frame)
         buttons.pack(fill="x", padx=6, pady=(4, 2))
-        ttk.Button(buttons, text="Refresh list", command=self._load_checkpoints).pack(side="left", padx=(0, 4))
+        ttk.Button(buttons, text="Refresh list", command=self._refresh_list).pack(side="left", padx=(0, 4))
         ttk.Button(buttons, text="Preview selected", command=self._preview_selected).pack(side="left", padx=(0, 4))
-        ttk.Button(buttons, text="Open splats folder", command=self._open_splats_folder).pack(side="right")
+        ttk.Button(buttons, text="Open folder", command=self._open_selected_folder).pack(side="right")
 
-        export_frame = ttk.LabelFrame(left_col, text="Export actions")
-        export_frame.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Label(export_frame, text="Export directory:").grid(row=0, column=0, sticky="w", padx=(6, 4), pady=(6, 4))
-        ttk.Entry(export_frame, textvariable=self.export_dir_var, width=50).grid(row=0, column=1, sticky="ew", pady=(6, 4))
-        ttk.Button(export_frame, text="Browse", command=self._choose_export_dir).grid(row=0, column=2, sticky="w", padx=6, pady=(6, 4))
-        ttk.Button(export_frame, text="Copy selected .ply", command=self._export_checkpoint).grid(row=1, column=0, sticky="w", padx=6, pady=(0, 6))
-        ttk.Button(export_frame, text="Render turntable.mp4", command=self._render_turntable).grid(row=1, column=1, sticky="w", padx=(0, 6), pady=(0, 6))
-        export_frame.columnconfigure(1, weight=1)
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(left_col, textvariable=self.status_var, foreground="#444").pack(
+            anchor="w", padx=10, pady=(0, 10)
+        )
 
         preview_frame = ttk.LabelFrame(right_col, text="Preview")
         preview_frame.pack(fill="both", expand=True, padx=10, pady=(10, 10))
         header = ttk.Frame(preview_frame)
         header.pack(fill="x", padx=6, pady=(6, 2))
+        self.preview_note_var = tk.StringVar(value="Preview idle.")
         ttk.Label(header, textvariable=self.preview_note_var, foreground="#444").pack(side="left")
         ttk.Button(header, text="Refresh preview", command=self._preview_selected).pack(side="right")
         preview_inner = ttk.Frame(preview_frame)
         preview_inner.pack(fill="both", expand=True, padx=6, pady=(6, 4))
         self.viewer = GLCanvas(preview_inner, device="cuda:0", width=960, height=540)
         self.viewer.pack(fill="both", expand=True)
+
         notebook = ttk.Notebook(preview_frame)
         notebook.pack(fill="x", padx=6, pady=(0, 6))
         render_tab = ttk.Frame(notebook)
@@ -127,7 +110,7 @@ class ExportsTab:
         self.colmap_panel = ColmapCameraPanel(
             camera_tab,
             viewer_getter=lambda: self.viewer,
-            scene_getter=lambda: self.app_state.current_scene_id,
+            scene_getter=lambda: self._current_scene_id,
             paths_getter=lambda scene: self.app_state.scene_manager.get(scene).paths,
         )
         self.colmap_panel.pack(fill="both", expand=True, padx=4, pady=(4, 4))
@@ -135,99 +118,88 @@ class ExportsTab:
             lkg_tab = ttk.Frame(notebook)
             notebook.add(lkg_tab, text="Looking Glass")
             self._build_lkg_panel(lkg_tab)
-        notebook.select(camera_tab)
 
-        ttk.Label(left_col, textvariable=self.status_var, foreground="#444").pack(
-            anchor="w", padx=10, pady=(0, 10)
-        )
-
-    def deactivate_viewer(self) -> None:
-        """Stop rendering and clear the exports viewer when hidden."""
-        if self.viewer is not None:
-            try:
-                self.viewer.stop_rendering()
-            except Exception:  # noqa: BLE001
-                self.logger.exception("Failed to deactivate exports viewer")
-        try:
-            if self._lkg_status_job is not None:
-                self.frame.after_cancel(self._lkg_status_job)
-        except Exception:
-            pass
-
-    def on_tab_selected(self, selected: bool) -> None:
-        self._tab_active = selected
-        if self.viewer is None:
+    def _open_selected_folder(self) -> None:
+        path = self._selected_checkpoint()
+        if path is None:
+            self.status_var.set("Select a checkpoint to open its folder.")
             return
-        if selected:
-            # Only spin up the renderer when the tab is visible.
-            self.logger.debug("Exports tab selected; pending preview=%s", self._pending_preview_path)
-            if self._pending_preview_path:
-                pending = self._pending_preview_path
-                self.frame.after(150, lambda path=pending: self._start_preview(path))
-            if self._lkg_enabled:
-                self._refresh_lkg_status()
-        else:
-            self.logger.debug("Exports tab hidden; stopping renderer")
-            try:
-                self.viewer.stop_rendering()
-            except Exception:  # noqa: BLE001
-                self.logger.exception("Failed to stop exports viewer")
-
-    def _refresh_scenes(self) -> None:
-        scenes = [str(status.scene_id) for status in self.app_state.scene_manager.list_scenes()]
-        self.scene_combo["values"] = scenes
-        current = self.app_state.current_scene_id
-        if current is None and scenes:
-            current = scenes[0]
-            self.app_state.set_current_scene(current)
-        if current is not None:
-            self.scene_var.set(str(current))
-        self.status_var.set("Scene list refreshed.")
-
-    def _load_checkpoints(self) -> None:
-        scene_id = self.scene_var.get().strip()
-        if not scene_id:
-            self.status_var.set("No scene selected.")
-            return
-        self.app_state.set_current_scene(scene_id)
         try:
-            paths = self.app_state.scene_manager.get(scene_id).paths
-        except FileNotFoundError:
-            paths = ensure_scene_dirs(scene_id, cache_root=self.app_state.config.cache_root)
-        splat_dir = paths.splats_dir
-        if not splat_dir.exists():
-            splat_dir.mkdir(parents=True, exist_ok=True)
-        checkpoints = sorted(
-            [p for p in splat_dir.iterdir() if p.suffix.lower() == ".ply"],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        self.checkpoint_paths = checkpoints
-        self.checkpoint_list.delete(0, tk.END)
-        for path in checkpoints:
-            self.checkpoint_list.insert(tk.END, path.name)
-        if checkpoints:
-            self.checkpoint_list.selection_set(0)
-            self._pending_preview_path = checkpoints[0]
-            if self._tab_active:
+            os.startfile(str(path.parent))
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception("Failed to open folder")
+            self.status_var.set(f"Open folder failed: {exc}")
+
+    def _scan_cache_outputs(self) -> List[Path]:
+        outputs_root = self.cache_root / "outputs"
+        if not outputs_root.exists():
+            return []
+        candidates: List[Path] = []
+        for path in outputs_root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in {".splat", ".ply"}:
+                candidates.append(path)
+        return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+
+    def _refresh_list(self) -> None:
+        self.status_var.set("Scanning cache outputs...")
+
+        def _do_scan() -> List[Path]:
+            return self._scan_cache_outputs()
+
+        def _on_success(paths: List[Path]) -> None:
+            self._entries = paths
+            self.checkpoint_list.delete(0, tk.END)
+            for path in paths:
+                label = self._display_label(path)
+                self.checkpoint_list.insert(tk.END, label)
+            if paths:
+                self.checkpoint_list.selection_set(0)
+                self._pending_preview_path = paths[0]
+            else:
+                self._pending_preview_path = None
+            self.status_var.set(f"Found {len(paths)} checkpoint(s) under cache outputs.")
+            self.preview_note_var.set("Preview idle." if paths else "No checkpoints yet.")
+            if paths:
                 self._preview_selected()
-        else:
-            self._pending_preview_path = None
-        self.preview_note_var.set("Preview idle." if checkpoints else "No checkpoints yet.")
-        self.status_var.set(f"Found {len(checkpoints)} checkpoint(s) in {splat_dir}.")
-        if hasattr(self, "colmap_panel"):
-            try:
-                self.colmap_panel.refresh()
-            except FileNotFoundError:
-                self.logger.debug("COLMAP panel refresh skipped; scene metadata missing.")
+
+        def _on_error(exc: Exception) -> None:
+            self.logger.exception("Cache scan failed")
+            self.status_var.set(f"Scan failed: {exc}")
+
+        run_in_background(
+            _do_scan,
+            tk_root=self.root,
+            on_success=_on_success,
+            on_error=_on_error,
+            thread_name="viewer_cache_scan",
+        )
+
+    def _display_label(self, path: Path) -> str:
+        scene_id = self._scene_from_path(path)
+        if scene_id:
+            return f"{scene_id} / {path.name}"
+        try:
+            rel = path.relative_to(self.cache_root)
+            return str(rel)
+        except ValueError:
+            return str(path)
+
+    def _scene_from_path(self, path: Path) -> Optional[str]:
+        try:
+            rel = path.relative_to(self.cache_root)
+        except ValueError:
+            return None
+        if len(rel.parts) >= 2 and rel.parts[0] == "outputs":
+            return rel.parts[1]
+        return None
 
     def _selected_checkpoint(self) -> Optional[Path]:
-        if not self.checkpoint_paths:
+        if not self._entries:
             return None
         selection = self.checkpoint_list.curselection()
         if not selection:
             return None
-        return self.checkpoint_paths[selection[0]]
+        return self._entries[selection[0]]
 
     def _preview_selected(self) -> None:
         checkpoint = self._selected_checkpoint()
@@ -236,40 +208,46 @@ class ExportsTab:
             self.status_var.set("Select a checkpoint to preview.")
             return
         self._pending_preview_path = checkpoint
-        if not self._tab_active:
-            # Defer expensive renderer startup until the tab is visible.
-            self.logger.debug("Deferring preview for %s until Exports tab is active", checkpoint)
-            return
+        self._current_scene_id = self._scene_from_path(checkpoint)
+        try:
+            if hasattr(self, "colmap_panel"):
+                self.colmap_panel.refresh()
+        except FileNotFoundError:
+            self.logger.debug("COLMAP panel refresh skipped; scene metadata missing.")
         self._start_preview(checkpoint)
 
     def _start_preview(self, checkpoint: Path, *, retry: bool = True) -> None:
-        """Start rendering/preview after ensuring the viewer is mapped."""
-        if not self._tab_active:
-            return
         if self.viewer is None:
             return
         if not self.viewer.winfo_ismapped():
             if retry:
                 self.logger.debug("Viewer not mapped yet; retrying preview for %s", checkpoint)
-                self.frame.after(100, lambda: self._start_preview(checkpoint, retry=False))
+                self.root.after(100, lambda: self._start_preview(checkpoint, retry=False))
             else:
                 self.logger.warning("Viewer still not mapped; skipping preview for %s", checkpoint)
             return
         try:
             self.viewer.start_rendering()
             self.viewer.load_splat(checkpoint)
-            self.logger.info(
-                "Exports preview request path=%s last_path=%s",
-                checkpoint,
-                self.viewer.last_path,
-            )
             self.status_var.set(f"Previewing {checkpoint.name}")
             self.preview_note_var.set(f"Previewing {checkpoint.name}")
-            self.logger.info("Preview loaded: %s", checkpoint)
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Failed to preview %s", checkpoint)
             self.status_var.set(f"Preview failed: {exc}")
             self.preview_note_var.set(f"Preview failed: {exc}")
+
+    def _on_close(self) -> None:
+        try:
+            if self.viewer is not None:
+                self.viewer.stop_rendering()
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed to stop viewer on close")
+        try:
+            if self._lkg_status_job is not None:
+                self.root.after_cancel(self._lkg_status_job)
+        except Exception:
+            pass
+        self.root.destroy()
 
     def _lkg_sink(self):
         if self.viewer is None:
@@ -284,7 +262,7 @@ class ExportsTab:
         return None
 
     def _refresh_lkg_status(self) -> None:
-        if not self._lkg_enabled or not self._tab_active:
+        if not self._lkg_enabled:
             return
         sink = self._lkg_sink()
         if sink is None:
@@ -307,10 +285,10 @@ class ExportsTab:
                 pass
         try:
             if self._lkg_status_job is not None:
-                self.frame.after_cancel(self._lkg_status_job)
+                self.root.after_cancel(self._lkg_status_job)
         except Exception:
             pass
-        self._lkg_status_job = self.frame.after(1000, self._refresh_lkg_status)
+        self._lkg_status_job = self.root.after(1000, self._refresh_lkg_status)
 
     def _lkg_retry_clicked(self) -> None:
         sink = self._lkg_sink()
@@ -350,10 +328,10 @@ class ExportsTab:
             return
         try:
             if self._lkg_apply_job is not None:
-                self.frame.after_cancel(self._lkg_apply_job)
+                self.root.after_cancel(self._lkg_apply_job)
         except Exception:
             pass
-        self._lkg_apply_job = self.frame.after(150, self._lkg_apply_clicked)
+        self._lkg_apply_job = self.root.after(150, self._lkg_apply_clicked)
 
     def _build_lkg_panel(self, parent: ttk.Frame) -> None:
         status_card = ttk.LabelFrame(parent, text="Looking Glass Bridge")
@@ -439,121 +417,13 @@ class ExportsTab:
 
         self._refresh_lkg_status()
 
-    def _choose_export_dir(self) -> None:
-        chosen = filedialog.askdirectory()
-        if chosen:
-            self.export_dir_var.set(chosen)
+    def run(self) -> None:
+        self.root.mainloop()
 
-    def _export_checkpoint(self) -> None:
-        checkpoint = self._selected_checkpoint()
-        if checkpoint is None:
-            self.status_var.set("Select a checkpoint to export.")
-            return
-        export_dir = Path(self.export_dir_var.get().strip())
-        if not export_dir:
-            self.status_var.set("Provide a target export directory.")
-            return
-        export_dir.mkdir(parents=True, exist_ok=True)
-        target = export_dir / checkpoint.name
-        shutil.copy2(checkpoint, target)
-        self.status_var.set(f"Copied to {target}")
-        self.logger.info("Exported checkpoint %s to %s", checkpoint, target)
 
-    def _render_turntable(self) -> None:
-        checkpoint = self._selected_checkpoint()
-        if checkpoint is None:
-            self.status_var.set("Select a checkpoint before rendering a turntable.")
-            return
-        scene_id = self.scene_var.get().strip()
-        if not scene_id:
-            self.status_var.set("Select a scene before rendering a turntable.")
-            return
-        if self.viewer is None:
-            self.status_var.set("Viewer not initialized.")
-            return
-        paths = self.app_state.scene_manager.get(scene_id).paths
-        render_dir = paths.renders_dir
-        render_dir.mkdir(parents=True, exist_ok=True)
-        turntable_path = render_dir / "turntable.mp4"
-        export_dir = Path(self.export_dir_var.get().strip()) if self.export_dir_var.get().strip() else None
+def run_viewer_app(cache_root: Optional[Path] = None) -> None:
+    app = ViewerApp(cache_root or Path("cache"))
+    app.run()
 
-        def _build_turntable() -> Path:
-            renderer = self.viewer.renderer
-            data = renderer.data
-            if data is None or self.viewer.last_path != checkpoint:
-                data = renderer.load(checkpoint)
-                self.logger.info("Turntable loaded %s for rendering", checkpoint)
-            base_view = CameraView(
-                yaw=0.0,
-                pitch=0.2,
-                distance=max(data.radius * 4.0, 1.0),
-                target=data.center,
-            )
-            width = max(1, int(self.viewer.canvas.winfo_width()))
-            height = max(1, int(self.viewer.canvas.winfo_height()))
-            frames = 60
-            self.logger.info(
-                "Turntable loop start scene=%s checkpoint=%s frames=%d size=%sx%s",
-                scene_id,
-                checkpoint,
-                frames,
-                width,
-                height,
-            )
-            with imageio.get_writer(turntable_path, fps=24) as writer:
-                for idx in range(frames):
-                    yaw = base_view.yaw + (2.0 * math.pi * idx / frames)
-                    cam_view = CameraView(
-                        yaw=yaw,
-                        pitch=base_view.pitch,
-                        distance=base_view.distance,
-                        target=base_view.target,
-                    )
-                    img = renderer.render(width, height, cam_view)
-                    writer.append_data(np.array(img))
-                    self.logger.info(
-                        "Turntable frame cycle scene=%s idx=%d/%d", scene_id, idx + 1, frames
-                    )
-            self.logger.info("Turntable loop stop scene=%s output=%s", scene_id, turntable_path)
-            if export_dir:
-                export_dir.mkdir(parents=True, exist_ok=True)
-                export_target = export_dir / turntable_path.name
-                shutil.copy2(turntable_path, export_target)
-                self.logger.info("Turntable copied to %s", export_target)
-            return turntable_path
 
-        def _on_success(path: Path) -> None:
-            self.status_var.set(f"Turntable rendered to {path}")
-
-        def _on_error(exc: Exception) -> None:
-            self.logger.exception("Turntable rendering failed")
-            self.status_var.set(f"Turntable failed: {exc}")
-            messagebox.showerror("Turntable failed", str(exc))
-
-        run_in_background(
-            _build_turntable,
-            tk_root=self.frame,
-            on_success=_on_success,
-            on_error=_on_error,
-            thread_name=f"turntable_{scene_id}",
-        )
-
-    def _open_splats_folder(self) -> None:
-        scene_id = self.scene_var.get().strip()
-        if not scene_id:
-            self.status_var.set("Select a scene to open its splats folder.")
-            return
-        paths = self.app_state.scene_manager.get(scene_id).paths
-        folder = paths.splats_dir
-        folder.mkdir(parents=True, exist_ok=True)
-        try:
-            os.startfile(str(folder))
-        except Exception as exc:  # noqa: BLE001
-            self.logger.exception("Failed to open splats folder")
-            self.status_var.set(f"Open folder failed: {exc}")
-
-    def on_scene_changed(self, scene_id: str | None) -> None:
-        if scene_id is not None:
-            self.scene_var.set(str(scene_id))
-            self.app_state.set_current_scene(scene_id)
-        self._load_checkpoints()
+__all__ = ["run_viewer_app", "ViewerApp"]

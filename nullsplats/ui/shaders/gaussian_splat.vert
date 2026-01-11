@@ -94,7 +94,7 @@ void main() {
         return;
     }
 
-    float tan_half_y = 1.0 / max(projection[1][1], 1e-6);
+    float tan_half_y = 1.0 / max(abs(projection[1][1]), 1e-6);
     float tan_half_x = tan_half_y * (viewport_size.x / max(viewport_size.y, 1.0));
     float focal = viewport_size.y / (2.0 * tan_half_y);
 

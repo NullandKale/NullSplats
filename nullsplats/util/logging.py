@@ -18,7 +18,7 @@ def setup_logging(
     log_dir: str | Path = "logs",
     log_name: str = "app.log",
     level: int = logging.DEBUG,
-    console_level: int = logging.INFO,
+    console_level: int = logging.DEBUG,
 ) -> logging.Logger:
     """Configure application logging for console and file outputs."""
     log_dir_path = Path(log_dir)

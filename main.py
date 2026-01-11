@@ -7,9 +7,12 @@ from pathlib import Path
 import sys
 import threading
 import shutil
+import argparse
+import os
 
 from nullsplats.app_state import AppState
 from nullsplats.ui.root import create_root
+from nullsplats.ui.viewer_app import run_viewer_app
 from nullsplats.util.logging import setup_logging, get_logger
 
 
@@ -30,6 +33,21 @@ def _clear_logs() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="NullSplats entrypoint")
+    parser.add_argument("--viewer", action="store_true", help="Launch the cache viewer app.")
+    parser.add_argument("--cache-root", default="cache", help="Cache root for the viewer app.")
+    parser.add_argument("--looking-glass", action="store_true", help="Enable Looking Glass preview output.")
+    parser.add_argument("--looking-glass-sdk", help="Path to Bridge SDK (folder containing bridge_python_sdk).")
+    parser.add_argument("--looking-glass-display", type=int, help="Looking Glass display index override.")
+    args = parser.parse_args()
+
+    if args.looking_glass:
+        os.environ.setdefault("NULLSPLATS_ENABLE_LOOKING_GLASS", "1")
+    if args.looking_glass_sdk:
+        os.environ["NULLSPLATS_LKG_SDK_PATH"] = args.looking_glass_sdk
+    if args.looking_glass_display is not None:
+        os.environ["NULLSPLATS_LKG_DISPLAY_INDEX"] = str(args.looking_glass_display)
+
     _clear_logs()
     setup_logging()
     logger = get_logger("main")
@@ -52,6 +70,12 @@ def main() -> None:
     faulthandler.dump_traceback_later(5.0, repeat=True, file=trace_handle)
     faulthandler.enable(file=trace_handle, all_threads=True)
     logger.info("Logging to console and logs/app.log tracebacks=%s", trace_log)
+    if args.viewer:
+        logger.info("Starting NullSplats cache viewer")
+        run_viewer_app(Path(args.cache_root))
+        logger.info("Viewer app exited")
+        return
+
     logger.info("Starting NullSplats UI")
     app_state = AppState()
     root = create_root(app_state)

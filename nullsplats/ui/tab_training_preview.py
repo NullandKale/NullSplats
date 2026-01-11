@@ -91,6 +91,11 @@ class TrainingTabPreviewMixin:
         if scene_id is None:
             self._set_status("Select a scene before refreshing preview.", is_error=True)
             return
+        if self.preview_canvas is not None:
+            try:
+                self.preview_canvas.reset_preview_pipelines()
+            except Exception:
+                self.logger.debug("Preview reset failed", exc_info=True)
         self._last_preview_path = None
         # Ensure polling is active for this manual refresh and force a fresh load.
         self._toggle_preview_poll(force_on=True)

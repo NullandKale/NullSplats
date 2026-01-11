@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from nullsplats.backend.io_cache import ScenePaths
 from nullsplats.backend.splat_train import PreviewPayload
 from nullsplats.util.logging import get_logger
+from nullsplats.optional_plugins import load_preview_sinks
+from nullsplats.ui.preview_outputs import PreviewFrameInfo, PreviewOutputSink
 
 
 logger = get_logger("ui.gl_canvas")
@@ -86,32 +88,48 @@ class SplatRenderer:
             size = -1
         logger.info("Renderer loading splats from %s size_bytes=%s", path, size)
         parse_start = time.perf_counter()
-        raw = _load_ply_properties(path)
-        logger.info("Renderer PLY parsed path=%s parse_ms=%.2f", path, (time.perf_counter() - parse_start) * 1000.0)
-        means = _stack_props(raw, ("x", "y", "z"))
-        dc = _stack_props(raw, ("f_dc_0", "f_dc_1", "f_dc_2")).reshape(-1, 1, 3)
-        rest_props = _collect_rest_props(raw)
-        if rest_props:
-            if len(rest_props) % 3 != 0:
-                raise ValueError("f_rest properties must be divisible by 3 for SH coefficients.")
-            sh_rest = _stack_props(raw, rest_props).reshape(-1, len(rest_props) // 3, 3)
-        else:
+        if path.suffix.lower() == ".splat":
+            parsed = _load_splat_binary(path)
+            means = parsed["means"]
+            scales_log = parsed["scales_log"]
+            quats_wxyz = parsed["quats_wxyz"]
+            opacities = parsed["opacities"]
+            dc = parsed["sh_dc"].reshape(-1, 1, 3)
             sh_rest = torch.zeros((means.shape[0], 0, 3), dtype=torch.float32)
-        sh_channels = dc.shape[1] + sh_rest.shape[1]
-        sh_degree = max(0, int(round(math.sqrt(sh_channels) - 1)))
-        logger.info(
-            "PLY stats path=%s verts=%d sh_channels=%d sh_degree=%d rest_props=%d",
-            path,
-            means.shape[0],
-            sh_channels,
-            sh_degree,
-            len(rest_props),
-        )
+            sh_degree = 0
+            logger.info(
+                "SPLAT stats path=%s verts=%d sh_degree=%d",
+                path,
+                means.shape[0],
+                sh_degree,
+            )
+        else:
+            raw = _load_ply_properties(path)
+            logger.info("Renderer PLY parsed path=%s parse_ms=%.2f", path, (time.perf_counter() - parse_start) * 1000.0)
+            means = _stack_props(raw, ("x", "y", "z"))
+            dc = _stack_props(raw, ("f_dc_0", "f_dc_1", "f_dc_2")).reshape(-1, 1, 3)
+            rest_props = _collect_rest_props(raw)
+            if rest_props:
+                if len(rest_props) % 3 != 0:
+                    raise ValueError("f_rest properties must be divisible by 3 for SH coefficients.")
+                sh_rest = _stack_props(raw, rest_props).reshape(-1, len(rest_props) // 3, 3)
+            else:
+                sh_rest = torch.zeros((means.shape[0], 0, 3), dtype=torch.float32)
+            sh_channels = dc.shape[1] + sh_rest.shape[1]
+            sh_degree = max(0, int(round(math.sqrt(sh_channels) - 1)))
+            logger.info(
+                "PLY stats path=%s verts=%d sh_channels=%d sh_degree=%d rest_props=%d",
+                path,
+                means.shape[0],
+                sh_channels,
+                sh_degree,
+                len(rest_props),
+            )
 
-        scales_log = _stack_props(raw, ("scale_0", "scale_1", "scale_2"))
-        opacities = _normalize_opacities(torch.tensor(raw["opacity"], dtype=torch.float32), path)
-        quats_wxyz = _stack_props(raw, ("rot_0", "rot_1", "rot_2", "rot_3"))
-        quats_wxyz = F.normalize(quats_wxyz, dim=1)
+            scales_log = _stack_props(raw, ("scale_0", "scale_1", "scale_2"))
+            opacities = _normalize_opacities(torch.tensor(raw["opacity"], dtype=torch.float32), path)
+            quats_wxyz = _stack_props(raw, ("rot_0", "rot_1", "rot_2", "rot_3"))
+            quats_wxyz = F.normalize(quats_wxyz, dim=1)
         logger.info("Renderer tensors prepared path=%s", path)
 
         center = means.mean(dim=0)
@@ -212,8 +230,13 @@ class GLCanvas(ttk.Frame):
         self._current_view: Optional[CameraView] = None
         self._resize_job: Optional[str] = None
         self._rendering: bool = False
-        self._init_viewer(width, height)
         self._camera_update_callbacks: list[Callable[[CameraView], None]] = []
+        self._preview_sinks: list[PreviewOutputSink] = []
+        self._preview_frame_id: int = 0
+        self._last_frame_ts: float = 0.0
+        self._frame_watchdog_job: Optional[str] = None
+        self._setup_preview_sinks()
+        self._init_viewer(width, height)
         # Ensure the frame itself expands with the paned container.
         self.pack_propagate(False)
 
@@ -234,6 +257,7 @@ class GLCanvas(ttk.Frame):
             # Throttle render restarts during Tk resize events to avoid GL context churn.
             self._viewer.bind("<Configure>", self._on_resize)
             self.canvas = self._viewer
+            self._notify_preview_sinks_viewer_ready(self._viewer)
         except Exception:  # noqa: BLE001
             logger.exception("Failed to initialize GaussianSplatViewer")
             label = ttk.Label(
@@ -265,6 +289,7 @@ class GLCanvas(ttk.Frame):
             try:
                 self._viewer.start_rendering()
                 self._rendering = True
+                self._schedule_frame_watchdog()
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to start OpenGL viewer")
         else:
@@ -282,6 +307,7 @@ class GLCanvas(ttk.Frame):
             try:
                 self._viewer.stop_rendering()
                 self._rendering = False
+                self._cancel_frame_watchdog()
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to stop OpenGL viewer")
 
@@ -291,6 +317,7 @@ class GLCanvas(ttk.Frame):
             self.stop_rendering()
         except Exception:  # noqa: BLE001
             logger.debug("Clear stop_rendering failed", exc_info=True)
+        self._cancel_frame_watchdog()
         with self._load_lock:
             self._latest_load_request += 1  # stale any in-flight loads
             self._last_path = None
@@ -312,6 +339,7 @@ class GLCanvas(ttk.Frame):
         if self._viewer is not None and hasattr(self._viewer, "render_once"):
             try:
                 self._viewer.render_once()
+                self._notify_preview_frame_rendered()
             except Exception:  # noqa: BLE001
                 logger.debug("Render-once failed", exc_info=True)
 
@@ -468,6 +496,92 @@ class GLCanvas(ttk.Frame):
             except Exception:  # noqa: BLE001
                 logger.exception("Camera listener callback failed")
 
+    def _setup_preview_sinks(self) -> None:
+        try:
+            sinks = load_preview_sinks()
+        except Exception:  # noqa: BLE001
+            logger.exception("Preview sink load failed; continuing without sinks.")
+            sinks = []
+        self._preview_sinks = sinks
+        for sink in self._preview_sinks:
+            if hasattr(sink, "on_camera_updated"):
+                self.add_camera_listener(lambda view, sink=sink: self._safe_sink_call(sink.on_camera_updated, view))
+
+    def _safe_sink_call(self, fn: Callable[..., object], *args, **kwargs) -> None:
+        try:
+            fn(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            logger.debug("Preview sink callback failed", exc_info=True)
+
+    def _notify_preview_sinks_viewer_ready(self, viewer: tk.Widget) -> None:
+        if not self._preview_sinks:
+            return
+        # Prefer viewer-level frame hooks so sinks can mirror live renders.
+        add_frame_listener = getattr(viewer, "add_frame_listener", None)
+        if callable(add_frame_listener):
+            try:
+                add_frame_listener(self._notify_preview_frame_rendered)
+            except Exception:  # noqa: BLE001
+                logger.debug("Failed to attach frame listener to viewer", exc_info=True)
+        for sink in self._preview_sinks:
+            if hasattr(sink, "on_viewer_ready"):
+                self._safe_sink_call(sink.on_viewer_ready, viewer)
+
+    def _notify_preview_sinks_viewer_destroyed(self) -> None:
+        if not self._preview_sinks:
+            return
+        for sink in self._preview_sinks:
+            if hasattr(sink, "on_viewer_destroyed"):
+                self._safe_sink_call(sink.on_viewer_destroyed)
+            if hasattr(sink, "stop"):
+                self._safe_sink_call(sink.stop)
+        self._preview_sinks = []
+
+    def _notify_preview_sinks_camera(self, view: Optional[CameraView]) -> None:
+        if view is None or not self._preview_sinks:
+            return
+        for sink in self._preview_sinks:
+            if hasattr(sink, "on_camera_updated"):
+                self._safe_sink_call(sink.on_camera_updated, view)
+
+    def _notify_preview_frame_rendered(self) -> None:
+        if not self._preview_sinks:
+            return
+        self._last_frame_ts = time.time()
+        self._schedule_frame_watchdog()
+        # Sync camera from the live viewer so preview sinks track actual mouse movement.
+        current = self._capture_viewer_camera()
+        if current is not None and _view_changed(self._current_view, current):
+            self._current_view = current
+            self._notify_camera_listeners(current)
+        self._preview_frame_id += 1
+        frame = PreviewFrameInfo(frame_id=self._preview_frame_id, timestamp=time.time())
+        for sink in self._preview_sinks:
+            if hasattr(sink, "on_frame_rendered"):
+                self._safe_sink_call(sink.on_frame_rendered, frame)
+
+    def get_preview_sinks(self) -> list[PreviewOutputSink]:
+        return list(self._preview_sinks)
+
+    def reset_preview_pipelines(self) -> None:
+        """Stop rendering and rebuild preview sinks for a clean restart."""
+        try:
+            self.stop_rendering()
+        except Exception:
+            logger.debug("reset_preview_pipelines: stop_rendering failed", exc_info=True)
+        try:
+            self._notify_preview_sinks_viewer_destroyed()
+        except Exception:
+            logger.debug("reset_preview_pipelines: sink teardown failed", exc_info=True)
+        try:
+            self._setup_preview_sinks()
+            if self._viewer is not None:
+                self._notify_preview_sinks_viewer_ready(self._viewer)
+                if self._current_view is not None:
+                    self._notify_preview_sinks_camera(self._current_view)
+        except Exception:
+            logger.debug("reset_preview_pipelines: sink reattach failed", exc_info=True)
+
     def _capture_viewer_camera(self) -> Optional[CameraView]:
         """Read the current viewer camera into a CameraView if available."""
         viewer = self._viewer
@@ -479,7 +593,7 @@ class GLCanvas(ttk.Frame):
                 return None
             pos = np.array(cam.position, dtype=np.float32)
             target = np.array(cam.target, dtype=np.float32)
-            direction = target - pos
+            direction = pos - target
             distance = float(np.linalg.norm(direction))
             if distance < 1e-6:
                 return None
@@ -517,11 +631,9 @@ class GLCanvas(ttk.Frame):
             eye = torch.tensor(pos, dtype=torch.float32)
             tgt = torch.tensor(target, dtype=torch.float32)
             up = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32)
-            view = _look_at_torch(eye, tgt, up)
-            rotation = view[:3, :3].detach().cpu().numpy()
             self._viewer.set_camera_pose(
                 eye.detach().cpu().numpy(),
-                rotation=rotation,
+                rotation=None,
                 target=tgt.detach().cpu().numpy(),
             )
         except Exception:  # noqa: BLE001
@@ -636,6 +748,7 @@ class GLCanvas(ttk.Frame):
             if hasattr(self._viewer, "render_once"):
                 try:
                     self._viewer.render_once()
+                    self._notify_preview_frame_rendered()
                 except Exception:  # noqa: BLE001
                     logger.debug("Render-once failed", exc_info=True)
             logger.info(
@@ -731,7 +844,7 @@ class GLCanvas(ttk.Frame):
             self._viewer.set_gaussians(means, scales, quats, opacities, sh_dc)
             # Preserve user camera if they orbited since the last load.
             captured_view = self._capture_viewer_camera()
-            if captured_view is not None:
+            if captured_view is not None and self._current_view is not None:
                 self._current_view = captured_view
             if self._current_view is None:
                 view = self._default_view_from_data(data, path)
@@ -769,6 +882,7 @@ class GLCanvas(ttk.Frame):
             if hasattr(self._viewer, "render_once"):
                 try:
                     self._viewer.render_once()
+                    self._notify_preview_frame_rendered()
                 except Exception:  # noqa: BLE001
                     logger.debug("Render-once failed", exc_info=True)
             logger.info("GLCanvas applied data %s gaussians=%d", path, means.shape[0])
@@ -777,7 +891,36 @@ class GLCanvas(ttk.Frame):
 
     def destroy(self) -> None:  # type: ignore[override]
         self.stop_rendering()
+        self._cancel_frame_watchdog()
+        self._notify_preview_sinks_viewer_destroyed()
         super().destroy()
+
+    def _schedule_frame_watchdog(self) -> None:
+        if self._frame_watchdog_job is not None:
+            return
+        self._frame_watchdog_job = self.after(250, self._frame_watchdog_tick)
+
+    def _cancel_frame_watchdog(self) -> None:
+        if self._frame_watchdog_job is None:
+            return
+        try:
+            self.after_cancel(self._frame_watchdog_job)
+        except Exception:
+            pass
+        self._frame_watchdog_job = None
+
+    def _frame_watchdog_tick(self) -> None:
+        self._frame_watchdog_job = None
+        if not self._rendering or self._viewer is None:
+            return
+        now = time.time()
+        if self._last_frame_ts and (now - self._last_frame_ts) > 0.5:
+            try:
+                if hasattr(self._viewer, "render_once"):
+                    self._viewer.render_once()
+            except Exception:
+                logger.debug("Frame watchdog render_once failed", exc_info=True)
+        self._schedule_frame_watchdog()
 
     def _default_view_from_data(self, data: SplatData, path: Path) -> CameraView:
         scene_id = path.parent.parent.name if path.parent.name == "splats" else None
@@ -793,9 +936,10 @@ class GLCanvas(ttk.Frame):
         camtoworld = _camera_to_world(view)
         cam_pos = camtoworld[:3, 3]
         try:
+            # Avoid passing rotation so the viewer uses target + stable world-up.
             self._viewer.set_camera_pose(
                 cam_pos.detach().cpu().numpy(),
-                rotation=torch.linalg.inv(camtoworld)[:3, :3].detach().cpu().numpy(),
+                rotation=None,
                 target=view.target.detach().cpu().numpy(),
             )
             logger.info(
@@ -805,6 +949,7 @@ class GLCanvas(ttk.Frame):
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to update OpenGL viewer camera")
+        self._notify_preview_sinks_camera(view)
 
 
 def _load_ply_properties(path: Path) -> np.ndarray:
@@ -896,6 +1041,43 @@ def _load_ply_properties(path: Path) -> np.ndarray:
     return arr
 
 
+def _load_splat_binary(path: Path) -> dict[str, torch.Tensor]:
+    data = path.read_bytes()
+    if not data:
+        raise ValueError("Empty .splat file.")
+    record_size = 32
+    if len(data) % record_size != 0:
+        raise ValueError(f"Invalid .splat file size ({len(data)} bytes).")
+    count = len(data) // record_size
+    dtype = np.dtype(
+        [
+            ("mean", "<f4", (3,)),
+            ("scale", "<f4", (3,)),
+            ("color", "u1", (4,)),
+            ("rot", "u1", (4,)),
+        ]
+    )
+    records = np.frombuffer(data, dtype=dtype, count=count)
+    means = torch.from_numpy(np.array(records["mean"], dtype=np.float32))
+    scales = torch.from_numpy(np.array(records["scale"], dtype=np.float32))
+    scales = torch.clamp(scales, min=1e-8)
+    scales_log = torch.log(scales)
+    colors = torch.from_numpy(records["color"].astype(np.float32) / 255.0)
+    rgb = colors[:, :3]
+    opacities = torch.clamp(colors[:, 3], 0.0, 1.0)
+    sh_dc = (rgb - 0.5) / 0.28209479177387814
+    quats = torch.from_numpy(records["rot"].astype(np.float32))
+    quats = (quats - 128.0) / 128.0
+    quats = F.normalize(quats, dim=1)
+    return {
+        "means": means,
+        "scales_log": scales_log,
+        "opacities": opacities,
+        "sh_dc": sh_dc,
+        "quats_wxyz": quats,
+    }
+
+
 def _stack_props(arr: np.ndarray, names: Iterable[str]) -> torch.Tensor:
     columns: List[np.ndarray] = []
     for name in names:
@@ -951,9 +1133,9 @@ def _to_numpy(data: np.ndarray | torch.Tensor) -> np.ndarray:
 def _look_at_torch(eye: torch.Tensor, target: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     forward = target - eye
     forward = forward / (torch.linalg.norm(forward) + 1e-8)
-    right = torch.cross(forward, up)
+    right = torch.cross(forward, up, dim=0)
     right = right / (torch.linalg.norm(right) + 1e-8)
-    true_up = torch.cross(right, forward)
+    true_up = torch.cross(right, forward, dim=0)
 
     view = torch.eye(4, device=eye.device, dtype=torch.float32)
     view[0, :3] = right
@@ -1002,6 +1184,22 @@ def _pan_delta(view: CameraView, dx_pixels: float, dy_pixels: float) -> torch.Te
     return (-dx_pixels * scale) * right + (dy_pixels * scale) * up
 
 
+def _view_changed(prev: Optional[CameraView], curr: CameraView, *, eps: float = 1e-4) -> bool:
+    if prev is None:
+        return True
+    if abs(prev.yaw - curr.yaw) > eps:
+        return True
+    if abs(prev.pitch - curr.pitch) > eps:
+        return True
+    if abs(prev.distance - curr.distance) > eps:
+        return True
+    try:
+        delta = (prev.target - curr.target).abs().max().item()
+        return float(delta) > eps
+    except Exception:
+        return True
+
+
 def _rasterize(
     *,
     means: torch.Tensor,
@@ -1048,7 +1246,7 @@ def _rasterize(
 
 
 def _vector_to_angles(vec: torch.Tensor) -> tuple[float, float]:
-    """Convert a direction vector into yaw/pitch matching CameraView conventions."""
+    """Convert a target-to-camera direction vector into yaw/pitch."""
     v = vec.detach().cpu().numpy().astype(float)
     vx, vy, vz = v.tolist()
     horiz = math.hypot(vx, vz)
@@ -1082,7 +1280,7 @@ def _colmap_default_view(scene_id: str, data: SplatData) -> Optional[CameraView]
             return None
         c2w = _cam_to_world_from_qt(image_entry["qvec"], image_entry["tvec"], device=data.center.device)
         cam_pos = c2w[:3, 3]
-        direction = (data.center - cam_pos)
+        direction = (cam_pos - data.center)
         yaw, pitch = _vector_to_angles(direction)
         dist = float(torch.linalg.norm(direction).item())
         min_dist = max(data.radius * 1.5, 0.5)
