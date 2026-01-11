@@ -9,6 +9,7 @@ from nullsplats.ui.advanced_render_controls import AdvancedRenderSettingsPanel
 from nullsplats.ui.colmap_camera_panel import ColmapCameraPanel
 from nullsplats.ui.gl_canvas import GLCanvas
 from nullsplats.ui.render_controls import RenderSettingsPanel
+from nullsplats.optional_plugins import looking_glass_available
 
 
 class TrainingTabLayoutMixin:
@@ -99,6 +100,11 @@ class TrainingTabLayoutMixin:
             paths_getter=lambda scene: self.app_state.scene_manager.get(scene).paths,
         )
         self.colmap_panel.pack(fill="both", expand=True, padx=4, pady=(4, 4))
+        self._lkg_enabled = looking_glass_available()
+        if self._lkg_enabled:
+            bridge_tab = ttk.Frame(notebook)
+            notebook.add(bridge_tab, text="Looking Glass")
+            self._build_lkg_panel(bridge_tab)
         notebook.select(camera_tab)
 
         # --- Left: workflow-focused, minimal primary controls ---
@@ -515,4 +521,86 @@ class TrainingTabLayoutMixin:
         toggle_btn = ttk.Button(header, text="Show" if start_hidden else "Hide", width=6, command=_toggle)
         toggle_btn.pack(side="right")
         return body
+
+    def _build_lkg_panel(self, parent: ttk.Frame) -> None:
+        status_card = ttk.LabelFrame(parent, text="Looking Glass Bridge")
+        status_card.pack(fill="x", padx=6, pady=6)
+        ttk.Label(status_card, textvariable=self.lkg_status_var, font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=6, pady=(6, 2)
+        )
+        ttk.Label(status_card, textvariable=self.lkg_detail_var, foreground="#444", wraplength=520).pack(
+            anchor="w", padx=6, pady=(0, 6)
+        )
+        btn_row = ttk.Frame(status_card)
+        btn_row.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(btn_row, text="Retry Bridge", command=self._lkg_retry_clicked).pack(side="left")
+        ttk.Button(btn_row, text="Refresh status", command=self._refresh_lkg_status).pack(side="left", padx=(6, 0))
+
+        ctrl_card = ttk.LabelFrame(parent, text="Depth / focus")
+        ctrl_card.pack(fill="x", padx=6, pady=(0, 6))
+        form = ttk.Frame(ctrl_card)
+        form.pack(fill="x", padx=6, pady=6)
+        self._lkg_depthiness_label = tk.StringVar(value=f"{self.lkg_depthiness_var.get():.2f}")
+        ttk.Label(form, text="Depthiness:").grid(row=0, column=0, sticky="w")
+        ttk.Scale(
+            form,
+            from_=0.0,
+            to=5.0,
+            variable=self.lkg_depthiness_var,
+            command=lambda _v: (self._lkg_depthiness_label.set(f"{self.lkg_depthiness_var.get():.2f}"), self._lkg_schedule_apply()),
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 8))
+        ttk.Label(form, textvariable=self._lkg_depthiness_label, width=6).grid(row=0, column=2, sticky="w")
+        ttk.Label(form, text="Focus:").grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self._lkg_focus_label = tk.StringVar(value=f"{self.lkg_focus_var.get():.2f}")
+        ttk.Scale(
+            form,
+            from_=-10.0,
+            to=10.0,
+            variable=self.lkg_focus_var,
+            command=lambda _v: (self._lkg_focus_label.set(f"{self.lkg_focus_var.get():.2f}"), self._lkg_schedule_apply()),
+        ).grid(row=0, column=4, sticky="ew", padx=(4, 8))
+        ttk.Label(form, textvariable=self._lkg_focus_label, width=6).grid(row=0, column=5, sticky="w")
+
+        row_zoom = ttk.Frame(ctrl_card)
+        row_zoom.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Label(row_zoom, text="Zoom:").grid(row=0, column=0, sticky="w")
+        self._lkg_zoom_label = tk.StringVar(value=f"{self.lkg_zoom_var.get():.2f}")
+        ttk.Scale(
+            row_zoom,
+            from_=0.1,
+            to=4.0,
+            variable=self.lkg_zoom_var,
+            command=lambda _v: (self._lkg_zoom_label.set(f"{self.lkg_zoom_var.get():.2f}"), self._lkg_schedule_apply()),
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 8))
+        ttk.Label(row_zoom, textvariable=self._lkg_zoom_label, width=6).grid(row=0, column=2, sticky="w")
+        ttk.Button(row_zoom, text="Apply", command=self._lkg_apply_clicked).grid(row=0, column=3, sticky="w", padx=(8, 0))
+
+        row2 = ttk.Frame(ctrl_card)
+        row2.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Label(row2, text="FOV (deg):").grid(row=0, column=0, sticky="w")
+        self._lkg_fov_label = tk.StringVar(value=f"{self.lkg_fov_var.get():.1f}")
+        ttk.Scale(
+            row2,
+            from_=5.0,
+            to=120.0,
+            variable=self.lkg_fov_var,
+            command=lambda _v: (self._lkg_fov_label.set(f"{self.lkg_fov_var.get():.1f}"), self._lkg_schedule_apply()),
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 8))
+        ttk.Label(row2, textvariable=self._lkg_fov_label, width=6).grid(row=0, column=2, sticky="w")
+        ttk.Label(row2, text="Viewcone (deg):").grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self._lkg_viewcone_label = tk.StringVar(value=f"{self.lkg_viewcone_var.get():.1f}")
+        ttk.Scale(
+            row2,
+            from_=0.0,
+            to=89.0,
+            variable=self.lkg_viewcone_var,
+            command=lambda _v: (self._lkg_viewcone_label.set(f"{self.lkg_viewcone_var.get():.1f}"), self._lkg_schedule_apply()),
+        ).grid(row=0, column=4, sticky="ew", padx=(4, 8))
+        ttk.Label(row2, textvariable=self._lkg_viewcone_label, width=6).grid(row=0, column=5, sticky="w")
+
+        form.columnconfigure(1, weight=1)
+        form.columnconfigure(4, weight=1)
+        row_zoom.columnconfigure(1, weight=1)
+        row2.columnconfigure(1, weight=1)
+        row2.columnconfigure(4, weight=1)
 

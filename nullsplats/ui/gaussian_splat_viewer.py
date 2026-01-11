@@ -7,7 +7,7 @@ Gaussians as textured quads with shader-based falloff, embedded in Tkinter.
 import tkinter as tk
 from tkinter import ttk
 import numpy as np
-from typing import Optional
+from typing import Callable, List, Optional
 import logging
 import ctypes
 import math
@@ -66,8 +66,12 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
         # Shader program and buffers
         self.shader_program = None
         self.quad_vao = None
+        self.quad_vao_onscreen = None
+        self.quad_vao_offscreen = None
         self.quad_vbo = None
-        self.instance_vbo = None     # Per-instance attributes
+        self.instance_vbo = None     # Per-instance attributes (onscreen default)
+        self.instance_vbo_onscreen = None
+        self.instance_vbo_offscreen = None
         
         # Camera with proper look-at system
         self.camera = Camera()
@@ -94,15 +98,34 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
 
         # Depth sorting - initially sort every frame to ensure visibility
         self._sorted_indices = None
-        self._needs_depth_sort = True
+        self._mark_depth_sort_needed()
+        self._needs_depth_sort_onscreen = True
+        self._needs_depth_sort_offscreen = True
         self._frame_count = 0
         self._sort_back_to_front = False
+        self._invert_onscreen_sort = True
+        self._invert_offscreen_sort = True
+        self._last_onscreen_sort_view = None
+        self._frame_listeners: List[Callable[[], None]] = []
+        self._suspend_frame_listeners = False
+        self._rendering_offscreen = False
+        self._preserve_viewport = False
+        self._flip_y = True
+        self._view_offset_x = 0.0
+        self._projection_shift_x = 0.0
+        self._invert_view_y = False
+        self._offscreen_sort_view = None
+        self._fov_deg = 45.0
         
         if not OPENGL_AVAILABLE:
             super().__init__(parent)
             self._show_error()
         else:
             super().__init__(parent, width=width, height=height)
+            try:
+                self.configure(takefocus=True)
+            except Exception:
+                pass
             self.bind("<Button-1>", self._on_left_mouse_down)
             self.bind("<Button-3>", self._on_right_mouse_down)
             self.bind("<B1-Motion>", self._on_left_mouse_drag)
@@ -110,6 +133,7 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             self.bind("<MouseWheel>", self._on_mouse_wheel)
             self.bind("<ButtonRelease-1>", self._on_mouse_up)
             self.bind("<ButtonRelease-3>", self._on_mouse_up)
+            self.bind("<Enter>", lambda _event: self.focus_set())
             # Keep the render loop paused until data or explicit start is requested.
             self.animate = 0
     
@@ -227,6 +251,61 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
         glDeleteShader(fragment_shader)
         
         logger.info("Gaussian splat shaders compiled successfully")
+
+    def _setup_instance_vao(self, vao: int, instance_vbo: int) -> None:
+        """Bind quad + instance attributes into a VAO."""
+        glBindVertexArray(vao)
+
+        # Quad vertices (location 0).
+        glBindBuffer(GL_ARRAY_BUFFER, self.quad_vbo)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
+
+        # Per-instance attributes.
+        glBindBuffer(GL_ARRAY_BUFFER, instance_vbo)
+        stride = (3 + 3 + 4 + 1 + 3) * 4
+
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+        glVertexAttribDivisor(1, 1)
+
+        glEnableVertexAttribArray(2)
+        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(3 * 4))
+        glVertexAttribDivisor(2, 1)
+
+        glEnableVertexAttribArray(3)
+        glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(6 * 4))
+        glVertexAttribDivisor(3, 1)
+
+        glEnableVertexAttribArray(4)
+        glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(10 * 4))
+        glVertexAttribDivisor(4, 1)
+
+        glEnableVertexAttribArray(5)
+        glVertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(11 * 4))
+        glVertexAttribDivisor(5, 1)
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        glBindVertexArray(0)
+
+    def _active_instance_vbo(self):
+        if self._rendering_offscreen and self.instance_vbo_offscreen is not None:
+            return self.instance_vbo_offscreen
+        if self.instance_vbo_onscreen is not None:
+            return self.instance_vbo_onscreen
+        return self.instance_vbo
+
+    def _active_vao(self):
+        if self._rendering_offscreen and self.quad_vao_offscreen is not None:
+            return self.quad_vao_offscreen
+        if self.quad_vao_onscreen is not None:
+            return self.quad_vao_onscreen
+        return self.quad_vao
+
+    def _mark_depth_sort_needed(self) -> None:
+        self._needs_depth_sort = True
+        self._needs_depth_sort_onscreen = True
+        self._needs_depth_sort_offscreen = True
     
     def _create_quad_geometry(self):
         """Create unit quad geometry for instanced rendering."""
@@ -243,53 +322,23 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             -1.0,  1.0,
         ], dtype=np.float32)
         
-        # Create VAO
-        self.quad_vao = glGenVertexArrays(1)
-        glBindVertexArray(self.quad_vao)
-        
         # Create VBO for quad vertices
         self.quad_vbo = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.quad_vbo)
         glBufferData(GL_ARRAY_BUFFER, quad_vertices.nbytes, quad_vertices, GL_STATIC_DRAW)
-        
-        # Set up vertex attribute (location 0: quad_vertex)
-        glEnableVertexAttribArray(0)
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, ctypes.c_void_p(0))
-        
-        # Create VBO for per-instance attributes
-        self.instance_vbo = glGenBuffers(1)
-        glBindBuffer(GL_ARRAY_BUFFER, self.instance_vbo)
-        
-        # Set up per-instance attributes (will be filled with data later)
-        stride = (3 + 3 + 4 + 1 + 3) * 4  # mean(3) + scale(3) + rot(4) + opacity(1) + sh_dc(3)
-        
-        # Location 1: gaussian_mean (vec3)
-        glEnableVertexAttribArray(1)
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
-        glVertexAttribDivisor(1, 1)  # Advance once per instance
-        
-        # Location 2: gaussian_scale (vec3)
-        glEnableVertexAttribArray(2)
-        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(3 * 4))
-        glVertexAttribDivisor(2, 1)
-        
-        # Location 3: gaussian_rotation (vec4)
-        glEnableVertexAttribArray(3)
-        glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(6 * 4))
-        glVertexAttribDivisor(3, 1)
-        
-        # Location 4: gaussian_opacity (float)
-        glEnableVertexAttribArray(4)
-        glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(10 * 4))
-        glVertexAttribDivisor(4, 1)
-        
-        # Location 5: gaussian_sh_dc (vec3)
-        glEnableVertexAttribArray(5)
-        glVertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(11 * 4))
-        glVertexAttribDivisor(5, 1)
-        
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
-        glBindVertexArray(0)
+
+        # Create per-instance buffers for onscreen/offscreen paths.
+        self.instance_vbo_onscreen = glGenBuffers(1)
+        self.quad_vao_onscreen = glGenVertexArrays(1)
+        self._setup_instance_vao(self.quad_vao_onscreen, self.instance_vbo_onscreen)
+
+        self.instance_vbo_offscreen = glGenBuffers(1)
+        self.quad_vao_offscreen = glGenVertexArrays(1)
+        self._setup_instance_vao(self.quad_vao_offscreen, self.instance_vbo_offscreen)
+
+        # Default to onscreen buffers for legacy code paths.
+        self.instance_vbo = self.instance_vbo_onscreen
+        self.quad_vao = self.quad_vao_onscreen
         
         logger.info("Quad geometry created for instanced rendering")
     
@@ -370,7 +419,7 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             'sh_dc': sh_dc
         }
         self._needs_data_upload = True
-        self._needs_depth_sort = True
+        self._mark_depth_sort_needed()
         self._frame_count = 0  # Reset frame counter
         
         logger.info(f"Gaussian data staged for upload")
@@ -400,9 +449,15 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             # Flatten
             data_flat = data.flatten()
             
-            # Upload to GPU
-            glBindBuffer(GL_ARRAY_BUFFER, self.instance_vbo)
-            glBufferData(GL_ARRAY_BUFFER, data_flat.nbytes, data_flat, GL_STATIC_DRAW)
+            # Upload to GPU (keep onscreen/offscreen buffers in sync).
+            target_vbos = [self.instance_vbo_onscreen, self.instance_vbo_offscreen]
+            if not any(target_vbos):
+                target_vbos = [self.instance_vbo]
+            for vbo in target_vbos:
+                if vbo is None:
+                    continue
+                glBindBuffer(GL_ARRAY_BUFFER, vbo)
+                glBufferData(GL_ARRAY_BUFFER, data_flat.nbytes, data_flat, GL_STATIC_DRAW)
             glBindBuffer(GL_ARRAY_BUFFER, 0)
             
             self.num_gaussians = n
@@ -468,8 +523,8 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
         cam_coords = torch.matmul(means_gpu, rot.T) + trans
         depths = cam_coords[:, 2]
 
-        # Sort by depth (ascending for back-to-front, descending otherwise)
-        descending = not self._sort_back_to_front
+        # Sort by depth (ascending for front-to-back, descending for back-to-front)
+        descending = self._effective_sort_back_to_front()
         sorted_indices = torch.argsort(depths, descending=descending)
 
         return sorted_indices.cpu().numpy().astype(np.int32)
@@ -480,7 +535,7 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
         Uses GPU-accelerated sorting via PyTorch when available (CUDA),
         falls back to CPU NumPy sorting otherwise.
         """
-        if self.means is None or not self._needs_depth_sort:
+        if self.means is None:
             return
         
         try:
@@ -511,7 +566,7 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
                 cam_coords = self.means @ rot.T + trans
                 depths = cam_coords[:, 2]
                 sorted_indices = np.argsort(depths)
-                if not self._sort_back_to_front:
+                if self._effective_sort_back_to_front():
                     sorted_indices = sorted_indices[::-1]
                 sorted_indices = sorted_indices.astype(np.int32)
             
@@ -529,11 +584,17 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
                 
                 # Upload to GPU
                 data_flat = sorted_data.flatten()
-                glBindBuffer(GL_ARRAY_BUFFER, self.instance_vbo)
-                glBufferData(GL_ARRAY_BUFFER, data_flat.nbytes, data_flat, GL_DYNAMIC_DRAW)
-                glBindBuffer(GL_ARRAY_BUFFER, 0)
+                target_vbo = self._active_instance_vbo() or self.instance_vbo
+                if target_vbo is not None:
+                    glBindBuffer(GL_ARRAY_BUFFER, target_vbo)
+                    glBufferData(GL_ARRAY_BUFFER, data_flat.nbytes, data_flat, GL_DYNAMIC_DRAW)
+                    glBindBuffer(GL_ARRAY_BUFFER, 0)
             
-            self._needs_depth_sort = False
+            if self._rendering_offscreen:
+                self._needs_depth_sort_offscreen = False
+            else:
+                self._needs_depth_sort_onscreen = False
+                self._needs_depth_sort = False
             
             # Log performance information
             logger.debug(f"Sorted {self.num_gaussians:,} Gaussians using {sort_method} in {sort_time*1000:.2f}ms ({1/sort_time:.1f} sorts/sec)")
@@ -587,23 +648,45 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             widget_aspect = self.width / self.height
             near_plane = max(self.scene_size * 0.01, 0.01)
             far_plane = max(self.scene_size * 10.0, near_plane * 10.0)
-            projection = self._perspective(45.0, widget_aspect, near_plane, far_plane)
+            projection = self._perspective(self._fov_deg, widget_aspect, near_plane, far_plane)
+            if self._flip_y:
+                projection[1, 1] *= -1.0
+            if self._projection_shift_x:
+                projection = projection.copy()
+                projection[0, 2] += self._projection_shift_x
             view = self.camera.get_view_matrix()
+            if self._view_offset_x:
+                view = view.copy()
+                view[0, 3] += self._view_offset_x
+            if self._invert_view_y:
+                view = view.copy()
+                view[1, :] *= -1.0
+
+            sort_view = view
+            if self._rendering_offscreen and self._offscreen_sort_view is not None:
+                sort_view = self._offscreen_sort_view
+            needs_sort = self._needs_depth_sort_offscreen if self._rendering_offscreen else self._needs_depth_sort_onscreen
 
             # Depth sort (always for first few frames, then throttle)
-            self._frame_count += 1
-            if self._frame_count <= 30:
-                if self._needs_depth_sort:
-                    self._depth_sort_gaussians(view)
-            else:
-                if self._needs_depth_sort:
-                    if not hasattr(self, '_frames_since_sort'):
-                        self._frames_since_sort = 0
-                    self._frames_since_sort += 1
+            if not self._rendering_offscreen:
+                self._frame_count += 1
+            if needs_sort:
+                if self._rendering_offscreen:
+                    if sort_view is not None:
+                        self._depth_sort_gaussians(sort_view)
+                else:
+                    if self._frame_count <= 30:
+                        if sort_view is not None:
+                            self._depth_sort_gaussians(sort_view)
+                    else:
+                        if not hasattr(self, '_frames_since_sort'):
+                            self._frames_since_sort = 0
+                        self._frames_since_sort += 1
 
-                    if self._frames_since_sort >= 10:
-                        self._depth_sort_gaussians(view)
-                        self._frames_since_sort = 0
+                        if self._frames_since_sort >= 10:
+                            if sort_view is not None:
+                                self._depth_sort_gaussians(sort_view)
+                            self._frames_since_sort = 0
 
             # DEBUG: Log first render
             if not hasattr(self, '_debug_logged'):
@@ -631,7 +714,8 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             # Keep viewport in sync with the Tk widget dimensions so the render fills the space.
             int_width = max(1, int(self.width))
             int_height = max(1, int(self.height))
-            glViewport(0, 0, int_width, int_height)
+            if not getattr(self, "_preserve_viewport", False):
+                glViewport(0, 0, int_width, int_height)
 
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
@@ -693,14 +777,15 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             glUniform2fv(viewport_size_loc, 1, viewport_size)
             
             # Ensure correct OpenGL state before drawing
-            glBindVertexArray(self.quad_vao)
+            active_vao = self._active_vao()
+            glBindVertexArray(active_vao)
             
             # Check OpenGL state
             if self._frame_count == 1:
                 logger.info("=== OPENGL STATE CHECK ===")
                 logger.info(f"Depth test enabled: {glIsEnabled(GL_DEPTH_TEST)}")
                 logger.info(f"Blend enabled: {glIsEnabled(GL_BLEND)}")
-                logger.info(f"VAO bound: {self.quad_vao}")
+                logger.info(f"VAO bound: {active_vao}")
                 logger.info(f"Drawing {self.num_gaussians:,} instances")
             
             # Draw instanced quads
@@ -709,6 +794,14 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             
             # Unbind program
             glUseProgram(0)
+
+            # Notify any external listeners that a frame was rendered.
+            if self._frame_listeners and not self._suspend_frame_listeners:
+                for listener in list(self._frame_listeners):
+                    try:
+                        listener()
+                    except Exception:
+                        logger.debug("Frame listener failed", exc_info=True)
             
             # DEBUG: Check if anything was actually drawn (first frame only)
             if not hasattr(self, '_draw_logged'):
@@ -721,6 +814,118 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             
         except Exception as e:
             logger.exception("Error during Gaussian splat rendering")
+
+    def add_frame_listener(self, callback: Callable[[], None]) -> None:
+        """Register a callback to be invoked after each redraw."""
+        if not callable(callback):
+            return
+        self._frame_listeners.append(callback)
+
+    def render_once(self) -> None:
+        """Render a single onscreen frame without toggling the animate loop."""
+        if not OPENGL_AVAILABLE:
+            return
+        try:
+            make_current = getattr(self, "tkMakeCurrent", None)
+            swap = getattr(self, "tkSwapBuffers", None)
+            if callable(make_current):
+                make_current()
+            try:
+                from OpenGL.GL import (
+                    glBindFramebuffer,
+                    glDisable,
+                    glViewport,
+                    GL_FRAMEBUFFER,
+                    GL_SCISSOR_TEST,
+                )
+
+                glBindFramebuffer(GL_FRAMEBUFFER, 0)
+                glDisable(GL_SCISSOR_TEST)
+                glViewport(0, 0, max(1, int(self.width)), max(1, int(self.height)))
+            except Exception:
+                pass
+            self.redraw()
+            if callable(swap):
+                swap()
+        except Exception:
+            logger.debug("render_once failed", exc_info=True)
+
+    def render_offscreen(
+        self,
+        width: int,
+        height: int,
+        camera_pose: Optional[tuple[np.ndarray, np.ndarray]] = None,
+        *,
+        flip_y: bool = False,
+        view_offset_x: float = 0.0,
+        projection_shift_x: float = 0.0,
+        invert_view_y: bool = False,
+    ) -> bool:
+        """Render a single frame into the currently bound framebuffer.
+
+        width/height control the viewport size; the caller is responsible for binding
+        the desired framebuffer and restoring GL state.
+        """
+        if not OPENGL_AVAILABLE or self.shader_program is None:
+            return False
+        if self._rendering_offscreen:
+            return False
+        self._rendering_offscreen = True
+        prev_preserve = self._preserve_viewport
+        prev_width, prev_height = self.width, self.height
+        prev_pos = self.camera.position.copy()
+        prev_target = self.camera.target.copy()
+        prev_up = self.camera.up.copy()
+        prev_flip = self._flip_y
+        prev_view_offset = self._view_offset_x
+        prev_proj_shift = self._projection_shift_x
+        prev_invert_view = self._invert_view_y
+        prev_sort_view = self._offscreen_sort_view
+        try:
+            self._preserve_viewport = True
+            self._flip_y = bool(flip_y)
+            self._view_offset_x = float(view_offset_x)
+            self._projection_shift_x = float(projection_shift_x)
+            self._invert_view_y = bool(invert_view_y)
+            self.width = width
+            self.height = height
+            if camera_pose is not None:
+                pos, target = camera_pose
+                self.camera.set_position_direct(pos[0], pos[1], pos[2])
+                self.camera.set_target_direct(target[0], target[1], target[2])
+            try:
+                self._offscreen_sort_view = self.camera.get_view_matrix().copy()
+            except Exception:
+                self._offscreen_sort_view = None
+            self._suspend_frame_listeners = True
+            try:
+                make_current = getattr(self, "tkMakeCurrent", None)
+                if callable(make_current):
+                    make_current()
+            except Exception:
+                pass
+            self.redraw()
+            try:
+                from OpenGL.GL import glFlush
+
+                glFlush()
+            except Exception:
+                pass
+            return True
+        finally:
+            self._suspend_frame_listeners = False
+            self.width = prev_width
+            self.height = prev_height
+            self.camera.position = prev_pos
+            self.camera.target = prev_target
+            self.camera.up = prev_up
+            self._preserve_viewport = prev_preserve
+            self._flip_y = prev_flip
+            self._view_offset_x = prev_view_offset
+            self._projection_shift_x = prev_proj_shift
+            self._invert_view_y = prev_invert_view
+            self._offscreen_sort_view = prev_sort_view
+            self._rendering_offscreen = False
     
     def _perspective(self, fov: float, aspect: float, near: float, far: float) -> np.ndarray:
         """Create perspective projection matrix."""
@@ -737,12 +942,20 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
     # Mouse interaction handlers
     def _on_left_mouse_down(self, event):
         """Handle left mouse button press (rotation)."""
+        try:
+            self.focus_set()
+        except Exception:
+            pass
         self._last_x = event.x
         self._last_y = event.y
         self._mouse_button = 'left'
     
     def _on_right_mouse_down(self, event):
         """Handle right mouse button press (panning)."""
+        try:
+            self.focus_set()
+        except Exception:
+            pass
         self._last_x = event.x
         self._last_y = event.y
         self._mouse_button = 'right'
@@ -777,12 +990,11 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             ], dtype=np.float32)
 
             self.camera.position = self.camera.target + new_offset
-            # Match COLMAP/OpenCV camera convention used by set_camera_pose.
-            self.camera.up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
             
             self._last_x = event.x
             self._last_y = event.y
-            self._needs_depth_sort = True
+            self._mark_depth_sort_needed()
+            self._request_onscreen_redraw()
     
     def _on_right_mouse_drag(self, event):
         """Handle right mouse drag for panning."""
@@ -801,8 +1013,9 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             
             self._last_x = event.x
             self._last_y = event.y
-            self._needs_depth_sort = True
-            logger.info("Pan change -> camera pos=%s target=%s", tuple(self.camera.position.tolist()), tuple(self.camera.target.tolist()))
+            self._mark_depth_sort_needed()
+            logger.debug("Pan change -> camera pos=%s target=%s", tuple(self.camera.position.tolist()), tuple(self.camera.target.tolist()))
+            self._request_onscreen_redraw()
     
     def _on_mouse_up(self, event):
         """Handle mouse button release."""
@@ -823,8 +1036,18 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             # Zoom out
             self.camera.position -= direction * distance * 0.1
         
-        self._needs_depth_sort = True
-        logger.info("Zoom change -> camera pos=%s target=%s", tuple(self.camera.position.tolist()), tuple(self.camera.target.tolist()))
+        self._mark_depth_sort_needed()
+        logger.debug("Zoom change -> camera pos=%s target=%s", tuple(self.camera.position.tolist()), tuple(self.camera.target.tolist()))
+        self._request_onscreen_redraw()
+
+    def _request_onscreen_redraw(self) -> None:
+        if getattr(self, "_rendering_offscreen", False):
+            return
+        try:
+            if hasattr(self, "render_once"):
+                self.render_once()
+        except Exception:
+            logger.debug("Onscreen redraw failed", exc_info=True)
     
     # Settings
     def set_point_scale(self, scale: float):
@@ -841,27 +1064,40 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
         if arr.shape != (3,):
             raise ValueError("scale_bias must be an iterable of three floats")
         self.scale_bias = arr
-        self._needs_depth_sort = True
+        self._mark_depth_sort_needed()
 
     def set_opacity_bias(self, bias: float):
         """Adjust the sigmoid bias applied to each Gaussian's opacity."""
         if not OPENGL_AVAILABLE:
             return
         self.opacity_bias = float(bias)
-        self._needs_depth_sort = True
+        self._mark_depth_sort_needed()
 
     def set_sort_back_to_front(self, value: bool):
         """Toggle whether Gaussians are sorted back-to-front or front-to-back."""
         if not OPENGL_AVAILABLE:
             return
         self._sort_back_to_front = value
-        self._needs_depth_sort = True
+        self._mark_depth_sort_needed()
+
+    def set_fov_deg(self, value: float) -> None:
+        if not OPENGL_AVAILABLE:
+            return
+        self._fov_deg = float(value)
 
     def request_depth_sort(self):
         """Force the viewer to re-sort Gaussians on the next redraw."""
         if not OPENGL_AVAILABLE:
             return
-        self._needs_depth_sort = True
+        self._mark_depth_sort_needed()
+
+    def _effective_sort_back_to_front(self) -> bool:
+        effective = self._sort_back_to_front
+        if self._rendering_offscreen and self._invert_offscreen_sort:
+            effective = not effective
+        elif not self._rendering_offscreen and self._invert_onscreen_sort:
+            effective = not effective
+        return effective
     
     def set_debug_mode(self, enabled: bool):
         """Enable debug rendering mode (larger splats for visibility)."""
@@ -949,8 +1185,12 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
         try:
             super()._display()
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Display loop crashed")
-            self.animate = 0
+            logger.exception("Display loop crashed; continuing")
+            try:
+                if self.animate > 0 and getattr(self, "cb", None) is None:
+                    self.cb = self.after(50, self._display)
+            except Exception:
+                pass
     
     def set_camera_pose(self, position: np.ndarray, rotation: Optional[np.ndarray] = None, target: Optional[np.ndarray] = None):
         """Set camera to specific position with optional rotation or target.
@@ -970,7 +1210,7 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             # Camera-to-world rotation is the transpose
             R_T = rotation.T
             
-            # Camera looks along +Z in camera space for COLMAP-like data
+            # Camera looks along +Z in camera space for COLMAP-like data.
             forward_cam = np.array([0.0, 0.0, 1.0], dtype=np.float32)
             forward_world = R_T @ forward_cam
             
@@ -979,10 +1219,8 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             final_target = target_pos if target is None else target
             self.camera.set_target_direct(final_target[0], final_target[1], final_target[2])
             
-            # Set camera up vector (COLMAP/OpenCV is typically Y-down in camera space)
-            up_cam = np.array([0.0, -1.0, 0.0], dtype=np.float32)
-            up_world = R_T @ up_cam
-            self.camera.up = up_world
+            # Keep a stable world-up to avoid inverted flips when targets are provided.
+            self.camera.up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
             
         elif target is not None:
             self.camera.set_target_direct(target[0], target[1], target[2])
@@ -997,7 +1235,7 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
             logger.info(f"Camera set to scene center - position: ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
         
         # Trigger depth sort for new viewpoint
-        self._needs_depth_sort = True
+        self._mark_depth_sort_needed()
     
     
     
@@ -1036,6 +1274,8 @@ class GaussianSplatViewer(OpenGLFrame if OPENGL_AVAILABLE else tk.Frame):
                 self._pending_gaussians = None
                 self._needs_data_upload = False
                 self._needs_depth_sort = False
+                self._needs_depth_sort_onscreen = False
+                self._needs_depth_sort_offscreen = False
                 self.num_gaussians = 0
             except Exception as e:
                 logger.warning(f"Error during Gaussian splat cleanup: {e}")

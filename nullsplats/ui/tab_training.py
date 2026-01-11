@@ -83,6 +83,13 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
         self.da3_align_scale_var = tk.BooleanVar(value=True)
         self.da3_infer_gs_var = tk.BooleanVar(value=True)
         self.da3_allow_unposed_var = tk.BooleanVar(value=False)
+        self.lkg_status_var = tk.StringVar(value="Looking Glass: not started")
+        self.lkg_detail_var = tk.StringVar(value="")
+        self.lkg_depthiness_var = tk.DoubleVar(value=1.0)
+        self.lkg_focus_var = tk.DoubleVar(value=2.0)
+        self.lkg_fov_var = tk.DoubleVar(value=14.0)
+        self.lkg_viewcone_var = tk.DoubleVar(value=40.0)
+        self.lkg_zoom_var = tk.DoubleVar(value=1.0)
         self.sharp_checkpoint_path_var = tk.StringVar(value="")
         self.sharp_intrinsics_source_var = tk.StringVar(value="colmap")
         self.sharp_image_index_var = tk.IntVar(value=0)
@@ -115,9 +122,14 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
         self._gsplat_section_visible = True
         self._da3_section_visible = True
         self._sharp_section_visible = True
+        self._lkg_last_sink_id: Optional[int] = None
+        self._lkg_status_job: Optional[str] = None
+        self._lkg_apply_job: Optional[str] = None
 
         self._build_contents()
         self._apply_training_preset()  # default to medium preset settings
+        if getattr(self, "_lkg_enabled", False):
+            self._refresh_lkg_status()
         self._update_scene_label()
         self._schedule_preview_drain()
         self._apply_trainer_capabilities()
@@ -156,6 +168,97 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
         except Exception:  # noqa: BLE001
             return "Scene status unavailable."
 
+    def _lkg_sink(self):
+        if self.preview_canvas is None:
+            return None
+        try:
+            sinks = self.preview_canvas.get_preview_sinks()
+            for sink in sinks:
+                if sink.__class__.__name__ == "LookingGlassSink":
+                    return sink
+        except Exception:
+            return None
+        return None
+
+    def _refresh_lkg_status(self) -> None:
+        if not getattr(self, "_lkg_enabled", False):
+            return
+        sink = self._lkg_sink()
+        if sink is None:
+            self.lkg_status_var.set("Looking Glass: not available")
+            self.lkg_detail_var.set("Connect a Looking Glass and ensure Bridge is running.")
+        else:
+            try:
+                status, detail = sink.current_status() if hasattr(sink, "current_status") else ("Unknown", "")
+            except Exception:
+                status, detail = "Unknown", ""
+            self.lkg_status_var.set(f"Looking Glass: {status}")
+            self.lkg_detail_var.set(detail)
+            sid = id(sink)
+            if self._lkg_last_sink_id != sid:
+                self._lkg_last_sink_id = sid
+                try:
+                    self.lkg_depthiness_var.set(float(getattr(sink.config, "depthiness", self.lkg_depthiness_var.get())))
+                    self.lkg_focus_var.set(float(getattr(sink.config, "focus", self.lkg_focus_var.get())))
+                    self.lkg_fov_var.set(float(getattr(sink.config, "fov", self.lkg_fov_var.get())))
+                    self.lkg_viewcone_var.set(float(getattr(sink.config, "viewcone", self.lkg_viewcone_var.get())))
+                    self.lkg_zoom_var.set(float(getattr(sink.config, "zoom", self.lkg_zoom_var.get())))
+                except Exception:
+                    pass
+        try:
+            if self._lkg_status_job is not None:
+                self.frame.after_cancel(self._lkg_status_job)
+        except Exception:
+            pass
+        self._lkg_status_job = self.frame.after(1000, self._refresh_lkg_status)
+
+    def _lkg_retry_clicked(self) -> None:
+        if not getattr(self, "_lkg_enabled", False):
+            return
+        sink = self._lkg_sink()
+        if sink is None:
+            self.lkg_status_var.set("Looking Glass: not available")
+            return
+        try:
+            if self.preview_canvas is not None:
+                try:
+                    self.preview_canvas.reset_preview_pipelines()
+                except Exception:
+                    self.logger.debug("Preview pipeline reset during LKG retry failed", exc_info=True)
+            sink.retry_start()
+            self.lkg_status_var.set("Looking Glass: retrying…")
+            self.lkg_detail_var.set("Will start on next frame once GL context is ready.")
+        except Exception:
+            self.logger.debug("Looking Glass retry failed", exc_info=True)
+
+    def _lkg_apply_clicked(self) -> None:
+        if not getattr(self, "_lkg_enabled", False):
+            return
+        sink = self._lkg_sink()
+        if sink is None:
+            return
+        try:
+            sink.update_settings(
+                depthiness=self.lkg_depthiness_var.get(),
+                focus=self.lkg_focus_var.get(),
+                fov=self.lkg_fov_var.get(),
+                viewcone=self.lkg_viewcone_var.get(),
+                zoom=self.lkg_zoom_var.get(),
+            )
+            self.lkg_detail_var.set("Settings applied; next frame will use updated values.")
+        except Exception:
+            self.logger.debug("Looking Glass apply settings failed", exc_info=True)
+
+    def _lkg_schedule_apply(self) -> None:
+        if not getattr(self, "_lkg_enabled", False):
+            return
+        try:
+            if self._lkg_apply_job is not None:
+                self.frame.after_cancel(self._lkg_apply_job)
+        except Exception:
+            pass
+        self._lkg_apply_job = self.frame.after(150, self._lkg_apply_clicked)
+
     def _sfm_hint_text(self) -> str:
         scene = self.app_state.current_scene_id
         if scene is None:
@@ -192,6 +295,9 @@ class TrainingTab(TrainingTabLayoutMixin, TrainingTabPreviewMixin):
                 self.preview_canvas.stop_rendering()
             except Exception:  # noqa: BLE001
                 self.logger.exception("Failed to deactivate training preview viewer")
+        if getattr(self, "_lkg_enabled", False):
+            self.lkg_status_var.set("Looking Glass: idle")
+            self.lkg_detail_var.set("")
 
     def _scene_text(self) -> str:
         scene = self.app_state.current_scene_id

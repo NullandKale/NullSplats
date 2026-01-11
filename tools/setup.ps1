@@ -23,6 +23,7 @@ if ($unknownArgs.Count -gt 0) {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $venvPath = Join-Path $repoRoot ".venv"
+$venvPython = Join-Path $venvPath "Scripts\python.exe"
 $pipIndex = "https://download.pytorch.org/whl/cu128"
 $programFiles64 = $env:ProgramW6432
 if (-not $programFiles64) {
@@ -226,7 +227,7 @@ function Prebuild-Gsplat {
     $env:TORCH_CUDA_ARCH_LIST = "8.6"
   }
   Write-Host "Prebuilding gsplat CUDA extension (this may take a few minutes)..."
-  & python -c "from gsplat.cuda import _backend as b; print('gsplat CUDA ready:', b._C is not None)"
+  & $venvPython -c "from gsplat.cuda import _backend as b; print('gsplat CUDA ready:', b._C is not None)"
   $env:TORCH_CUDA_ARCH_LIST = $null
 }
 
@@ -243,13 +244,13 @@ if (-not (Test-Path $venvPath)) {
   & python -m venv $venvPath
 
   Write-Host "Activating venv..."
-  & "$venvPath\Scripts\Activate.ps1"
+  . "$venvPath\Scripts\Activate.ps1"
 
   Write-Host "Upgrading pip..."
-  & python -m pip install --upgrade pip
+  & $venvPython -m pip install --upgrade pip
 
   Write-Host "Installing build tools for gsplat..."
-  & pip install "setuptools" "wheel" "ninja" "numpy"
+  & $venvPython -m pip install "setuptools" "wheel" "ninja" "numpy"
 
   if (Test-Path (Join-Path $repoRoot ".gitmodules")) {
     if (Get-Command git -ErrorAction SilentlyContinue) {
@@ -263,30 +264,30 @@ if (-not (Test-Path $venvPath)) {
   }
 
   Write-Host "Installing PyTorch CUDA 12.8 build..."
-  & pip install --extra-index-url $pipIndex "torch==2.9.1+cu128"
+  & $venvPython -m pip install --extra-index-url $pipIndex "torch==2.9.1+cu128"
 
   $constraints = Join-Path $env:TEMP "nullsplats_constraints.txt"
   "torch==2.9.1+cu128" | Set-Content -Encoding ASCII $constraints
 
   Write-Host "Building gsplat from source (CUDA extension)..."
-  & pip install --no-deps --no-build-isolation --no-binary=gsplat --force-reinstall "gsplat==1.5.3"
+  & $venvPython -m pip install --no-deps --no-build-isolation --no-binary=gsplat --force-reinstall "gsplat==1.5.3"
   Prebuild-Gsplat
 
   Write-Host "Installing requirements..."
-  & pip install -r "$repoRoot\requirements.txt" -c $constraints --extra-index-url $pipIndex --no-binary=gsplat --no-build-isolation
+  & $venvPython -m pip install -r "$repoRoot\requirements.txt" -c $constraints --extra-index-url $pipIndex --no-binary=gsplat --no-build-isolation
   Remove-Item $constraints -ErrorAction SilentlyContinue
 
   Write-Host "Installing Depth Anything 3..."
   if (Test-Path (Join-Path $repoRoot "tools\depth-anything-3")) {
-    & pip install -e "$repoRoot\tools\depth-anything-3"
+    & $venvPython -m pip install -e "$repoRoot\tools\depth-anything-3"
   } else {
-    & pip install "git+https://github.com/ByteDance-Seed/Depth-Anything-3"
+    & $venvPython -m pip install "git+https://github.com/ByteDance-Seed/Depth-Anything-3"
   }
 
   Write-Host "Setup complete. You can now run: python main.py"
 } else {
   Write-Host "Venv already exists. Activating only..."
-  & "$venvPath\Scripts\Activate.ps1"
+  . "$venvPath\Scripts\Activate.ps1"
 
   Write-Host "Checking Visual Studio Build Tools..."
   Ensure-CompilerOnPath | Out-Null
@@ -297,9 +298,9 @@ if (-not (Test-Path $venvPath)) {
 
   Write-Host "Installing Depth Anything 3..."
   if (Test-Path (Join-Path $repoRoot "tools\depth-anything-3")) {
-    & pip install -e "$repoRoot\tools\depth-anything-3"
+    & $venvPython -m pip install -e "$repoRoot\tools\depth-anything-3"
   } else {
-    & pip install "git+https://github.com/ByteDance-Seed/Depth-Anything-3"
+    & $venvPython -m pip install "git+https://github.com/ByteDance-Seed/Depth-Anything-3"
   }
 
   Write-Host "Venv activated. You can now run: python main.py"
