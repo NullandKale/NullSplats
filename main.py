@@ -13,6 +13,7 @@ import os
 from nullsplats.app_state import AppState
 from nullsplats.ui.root import create_root
 from nullsplats.ui.viewer_app import run_viewer_app
+from nullsplats.ui.video_sharp_app import run_video_sharp_app
 from nullsplats.util.logging import setup_logging, get_logger
 
 
@@ -36,6 +37,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="NullSplats entrypoint")
     parser.add_argument("--viewer", action="store_true", help="Launch the cache viewer app.")
     parser.add_argument("--cache-root", default="cache", help="Cache root for the viewer app.")
+    parser.add_argument("--video-sharp", action="store_true", help="Launch the video SHARP app.")
+    parser.add_argument("--input", help="Input video path for the video SHARP app.")
     parser.add_argument("--looking-glass", action="store_true", help="Enable Looking Glass preview output.")
     parser.add_argument("--looking-glass-sdk", help="Path to Bridge SDK (folder containing bridge_python_sdk).")
     parser.add_argument("--looking-glass-display", type=int, help="Looking Glass display index override.")
@@ -70,6 +73,15 @@ def main() -> None:
     faulthandler.dump_traceback_later(5.0, repeat=True, file=trace_handle)
     faulthandler.enable(file=trace_handle, all_threads=True)
     logger.info("Logging to console and logs/app.log tracebacks=%s", trace_log)
+    if args.viewer and args.video_sharp:
+        logger.error("Choose either --viewer or --video-sharp, not both.")
+        return
+    if args.video_sharp:
+        logger.info("Starting NullSplats video SHARP app")
+        input_path = Path(args.input).expanduser() if args.input else None
+        run_video_sharp_app(Path(args.cache_root), input_path=input_path)
+        logger.info("Video SHARP app exited")
+        return
     if args.viewer:
         logger.info("Starting NullSplats cache viewer")
         run_viewer_app(Path(args.cache_root))

@@ -223,6 +223,7 @@ def _build_sharp_config(device: str, use_colmap: bool) -> dict[str, Any]:
         "device": device or "default",
         "intrinsics_source": "colmap" if use_colmap else "exif",
         "image_index": 0,
+        "use_compile": True,
     }
 
 

@@ -13,6 +13,17 @@ from pathlib import Path
 from typing import Optional
 
 
+class _SafeStreamHandler(logging.StreamHandler):
+    """Stream handler that ignores stream errors during shutdown."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        except OSError:
+            # Ignore broken/closed stdout/stderr handles during shutdown.
+            return
+
+
 def setup_logging(
     *,
     log_dir: str | Path = "logs",
@@ -42,7 +53,7 @@ def setup_logging(
     file_handler.setLevel(level)
     logger.addHandler(file_handler)
 
-    console_handler = logging.StreamHandler(stream=sys.stdout)
+    console_handler = _SafeStreamHandler(stream=sys.stdout)
     console_handler.setFormatter(formatter)
     console_handler.setLevel(console_level)
     logger.addHandler(console_handler)

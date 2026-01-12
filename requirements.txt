@@ -15,3 +15,4 @@ bridge-python-sdk @ git+https://github.com/Looking-Glass/bridge-python-sdk
 huggingface-hub==0.34.0
 transformers==4.40.2
 -e tools/sharp
+triton-windows
