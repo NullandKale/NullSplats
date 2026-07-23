@@ -29,5 +29,8 @@ tools/glomap/
 tools/colmap/
 tools/gsplat_examples/
 exports/
-log/test.log
+log/
 torch_extensions/*
+
+# Research scratch/progress notes
+nullsplats/research/pixel_ray_cache/PROGRESS.md

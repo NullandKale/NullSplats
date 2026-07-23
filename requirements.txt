@@ -12,4 +12,6 @@ PyOpenGL
 pyopengltk
 huggingface-hub==0.34.0
 transformers==4.40.2
+optuna
+addict  # depth_anything_3.model.da3 imports this but it's missing from tools/depth-anything-3's own pyproject.toml
 -e tools/sharp
